@@ -52,9 +52,13 @@ def isReleaseTask = gradle.startParameter.taskNames.any { taskName ->
 
 println "📦 当前版本: versionCode=$code, versionName=$name (isRelease=$isReleaseTask)"
 
-def releaseKeystoreFile = System.getenv("RELEASE_SIGNING_CONFIG_FILE") != null
-    ? file(System.getenv("RELEASE_SIGNING_CONFIG_FILE"))
-    : (file('release-key.jks').exists() ? file('release-key.jks') : null)
+def releaseKeystorePath = System.getenv("RELEASE_SIGNING_CONFIG_FILE")
+def releaseKeystoreCandidate = (releaseKeystorePath != null && !releaseKeystorePath.trim().isEmpty())
+    ? file(releaseKeystorePath.trim())
+    : file('release-key.jks')
+def releaseKeystoreFile = (releaseKeystoreCandidate.exists() && releaseKeystoreCandidate.length() > 0)
+    ? releaseKeystoreCandidate
+    : null
 def releaseStorePassword = readSecret("RELEASE_STORE_PASSWORD")
 def releaseKeyAlias = readSecret("RELEASE_KEY_ALIAS")
 def releaseKeyPassword = readSecret("RELEASE_KEY_PASSWORD")
