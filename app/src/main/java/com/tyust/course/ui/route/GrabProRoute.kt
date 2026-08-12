@@ -34,6 +34,7 @@ import com.tyust.course.manager.SmartSelector
 import com.tyust.course.manager.UserManager
 import com.tyust.course.model.SchoolConfig
 import com.tyust.course.receiver.GrabAlarmReceiver
+import com.tyust.course.session.CourseSelectionCapability
 import com.tyust.course.service.GrabService
 import com.tyust.course.ui.screen.GrabProScreen
 import com.tyust.course.ui.system.SystemDialog
@@ -95,6 +96,13 @@ fun GrabProRoute() {
         val newEntry = "[$timestamp] $message\n"
         val currentLines = (logText + newEntry).split("\n").filter { it.isNotBlank() }
         logText = currentLines.takeLast(100).joinToString("\n") + "\n"
+    }
+
+    fun requireCourseSelectionCapability(school: SchoolConfig): Boolean {
+        val message = CourseSelectionCapability.unavailableMessage(school) ?: return true
+        appendLog("⚠️ $message")
+        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+        return false
     }
     
     // 使用课程ID作为key的状态Map，支持持久化
@@ -269,6 +277,7 @@ fun GrabProRoute() {
             Toast.makeText(context, "请先登录", Toast.LENGTH_SHORT).show()
             return
         }
+        if (!requireCourseSelectionCapability(school)) return
 
         // 🔧 优先检查队列，如果队列不为空，则启动队列模式
         val queueList = SmartSelector.getInstance().queue
@@ -345,6 +354,7 @@ fun GrabProRoute() {
             Toast.makeText(context, "请先登录", Toast.LENGTH_SHORT).show()
             return
         }
+        if (!requireCourseSelectionCapability(school)) return
         
         val fuzzyTargetId = SmartSelector.getInstance().fuzzyMatchCourseId
         val fuzzyTargetName = SmartSelector.getInstance().fuzzyMatchCourseName
@@ -415,6 +425,13 @@ fun GrabProRoute() {
     }
     
     fun createScheduledTask() {
+        val scheduleSchool = UserManager.getInstance().currentSchool
+        if (scheduleSchool == null) {
+            Toast.makeText(context, "请先登录", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!requireCourseSelectionCapability(scheduleSchool)) return
+
         // 只使用队列中的课程
         if (queue.isEmpty()) { 
             Toast.makeText(context, "请先在队列中添加课程", Toast.LENGTH_SHORT).show()

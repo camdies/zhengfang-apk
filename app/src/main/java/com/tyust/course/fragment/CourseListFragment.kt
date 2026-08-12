@@ -17,6 +17,10 @@ import com.tyust.course.manager.UserManager
 import com.tyust.course.model.Course
 import com.tyust.course.model.SchoolConfig
 import com.tyust.course.network.CourseApiClient
+import com.tyust.course.session.ScnuProtocolCapabilities
+import com.tyust.course.session.SessionRequestContext
+import com.tyust.course.session.SessionRequestOwner
+import com.tyust.course.session.SessionRequestPurpose
 import com.tyust.course.ui.screen.CourseListScreen
 import com.tyust.course.ui.theme.CourseSelectorTheme
 import com.tyust.course.utils.CourseParser
@@ -70,7 +74,47 @@ class CourseListFragment : Fragment() {
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
+        if (isCourseSelectionBlocked(UserManager.getInstance().currentSchool)) {
+            return
+        }
         loadCourseParams()
+    }
+
+    private fun isCourseSelectionBlocked(school: SchoolConfig?): Boolean {
+        if (ScnuProtocolCapabilities.isCourseSelectionAllowed(school)) return false
+        if (isAdded) {
+            Toast.makeText(
+                requireContext(),
+                ScnuProtocolCapabilities.unavailableMessage(),
+                Toast.LENGTH_LONG
+            ).show()
+        }
+        return true
+    }
+
+    /**
+     * Capture the account, session generation and UI epoch at the start of a
+     * user operation.  Do not rebuild this context inside a delayed callback:
+     * a later account switch must make the old chain a harmless no-op.
+     */
+    private fun newUiRequestContext(school: SchoolConfig): SessionRequestContext =
+        SessionRequestContext.forSchool(
+            school = school,
+            accountStorageKey = UserManager.getInstance().currentAccountStorageKey,
+            purpose = SessionRequestPurpose.ACADEMIC_QUERY,
+            owner = SessionRequestOwner.UI
+        )
+
+    private fun isRequestCurrent(requestContext: SessionRequestContext): Boolean =
+        isAdded && requestContext.isSnapshotCurrent()
+
+    private fun runForRequestContext(
+        requestContext: SessionRequestContext,
+        action: () -> Unit
+    ) {
+        activity?.runOnUiThread {
+            if (isRequestCurrent(requestContext)) action()
+        }
     }
 
     private fun filterCourses(query: String) {
@@ -90,17 +134,21 @@ class CourseListFragment : Fragment() {
         if (school == null) {
             return
         }
+        if (isCourseSelectionBlocked(school)) return
+        val requestContext = newUiRequestContext(school)
 
         isLoading = true
-        CourseApiClient.getInstance().fetchCourseParams(school, object : Callback {
+        CourseApiClient.getInstance().fetchCourseParams(school, requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                activity?.runOnUiThread { loadCourses() }
+                runForRequestContext(requestContext) { loadCourses() }
             }
 
             override fun onResponse(call: Call, response: Response) {
                 val html = response.body?.string() ?: ""
-                courseParams = CourseParser.parseCourseParams(html)
-                activity?.runOnUiThread { loadCourses() }
+                runForRequestContext(requestContext) {
+                    courseParams = CourseParser.parseCourseParams(html)
+                    loadCourses()
+                }
             }
         })
     }
@@ -117,15 +165,18 @@ class CourseListFragment : Fragment() {
 
     private fun loadCourses() {
         val school = UserManager.getInstance().currentSchool ?: return
+        if (isCourseSelectionBlocked(school)) return
+        val requestContext = newUiRequestContext(school)
         isLoading = true
         courses = emptyList() // 清空列表
         
         // Start Step 1
         com.tyust.course.network.CourseApiClient.getInstance().fetchCourseParams(
             school,
+            requestContext,
             object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    activity?.runOnUiThread {
+                    runForRequestContext(requestContext) {
                         isLoading = false
                         showErrorDialog("获取选课参数失败", e.message ?: "未知网络错误")
                     }
@@ -133,13 +184,13 @@ class CourseListFragment : Fragment() {
 
                 override fun onResponse(call: Call, response: Response) {
                     val html = response.body?.string() ?: ""
-                    activity?.runOnUiThread {
+                    runForRequestContext(requestContext) {
                         parseIndexParams(html)
                         if (indexParams.isEmpty()) {
                             isLoading = false
                             showErrorDialog("解析失败", "未找到选课入口或参数，可能教务系统未开放或需要重新登录。")
                         } else {
-                            fetchDisplayPage(school)
+                            fetchDisplayPage(school, requestContext)
                         }
                     }
                 }
@@ -220,7 +271,11 @@ class CourseListFragment : Fragment() {
         }
     }
 
-    private fun fetchDisplayPage(school: SchoolConfig) {
+    private fun fetchDisplayPage(
+        school: SchoolConfig,
+        requestContext: SessionRequestContext
+    ) {
+        if (!isRequestCurrent(requestContext)) return
         // Use tabParamsList if available, otherwise use default from indexParams
         if (tabParamsList.isEmpty()) {
             val xkkz_id = indexParams["firstXkkzId"] ?: indexParams["xkkz_id"] ?: ""
@@ -243,13 +298,17 @@ class CourseListFragment : Fragment() {
         
         allCourses = emptyList()
         currentTabIndex = 0
-        fetchNextCategory(school)
+        fetchNextCategory(school, requestContext)
     }
 
-    private fun fetchNextCategory(school: SchoolConfig) {
+    private fun fetchNextCategory(
+        school: SchoolConfig,
+        requestContext: SessionRequestContext
+    ) {
+        if (!isRequestCurrent(requestContext)) return
         if (currentTabIndex >= tabParamsList.size) {
             // All done
-            activity?.runOnUiThread {
+            runForRequestContext(requestContext) {
                 isLoading = false
                 courses = allCourses
                 if (allCourses.isEmpty()) {
@@ -267,20 +326,21 @@ class CourseListFragment : Fragment() {
         // Fetch Display page for this category
         com.tyust.course.network.CourseApiClient.getInstance().fetchCourseDisplayParams(
             school, tab.xkkz_id, tab.kklxdm, tab.njdm_id, tab.zyh_id,
+            requestContext,
             object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    activity?.runOnUiThread { 
+                    runForRequestContext(requestContext) {
                         // Try fallback but log error
                         Log.w("CourseListFragment", "Failed to fetch display params for tab $currentTabIndex: ${e.message}")
-                        fetchCategoryList(school, tab) 
-                    } 
+                        fetchCategoryList(school, tab, requestContext)
+                    }
                 }
 
                 override fun onResponse(call: Call, response: Response) {
                     val html = response.body?.string() ?: ""
-                    activity?.runOnUiThread {
+                    runForRequestContext(requestContext) {
                         parseDisplayParams(html)
-                        fetchCategoryList(school, tab)
+                        fetchCategoryList(school, tab, requestContext)
                     }
                 }
             }
@@ -306,7 +366,12 @@ class CourseListFragment : Fragment() {
         }
     }
 
-    private fun fetchCategoryList(school: SchoolConfig, tab: TabParam) {
+    private fun fetchCategoryList(
+        school: SchoolConfig,
+        tab: TabParam,
+        requestContext: SessionRequestContext
+    ) {
+        if (!isRequestCurrent(requestContext)) return
         val mergedParams = mutableMapOf<String, String>()
         mergedParams.putAll(indexParams)
         mergedParams.putAll(displayParams)
@@ -363,12 +428,13 @@ class CourseListFragment : Fragment() {
         
         com.tyust.course.network.CourseApiClient.getInstance().fetchAvailableCourses(
             school, postBody,
+            requestContext,
             object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                     activity?.runOnUiThread {
+                     runForRequestContext(requestContext) {
                         // Show error dialog for course fetching failure
                         showErrorDialog("获取课程失败", "类别[${tab.kklxdm}]加载失败: ${e.message}\n尝试加载下一个类别...")
-                        fetchNextCategory(school) 
+                        fetchNextCategory(school, requestContext)
                     }
                 }
 
@@ -383,13 +449,15 @@ class CourseListFragment : Fragment() {
                     
                     // Check for error conditions
                     if (responseCode != 200) {
-                        activity?.runOnUiThread {
+                        runForRequestContext(requestContext) {
                             showErrorDialog("服务器响应异常", "HTTP状态码: $responseCode\n\n响应内容: ${json.take(300)}")
-                            fetchNextCategory(school)
+                            fetchNextCategory(school, requestContext)
                         }
                         return
                     }
                     
+                    if (!isRequestCurrent(requestContext)) return
+
                     // Check if response indicates login required
                     if (json.contains("用户登录") || json.contains("登 录") || json.contains("统一身份认证") || json.contains("请重新登录")) {
                         activity?.runOnUiThread {
@@ -401,7 +469,7 @@ class CourseListFragment : Fragment() {
                     
                     // Check for empty or error response
                     if (json.isEmpty()) {
-                        activity?.runOnUiThread {
+                        runForRequestContext(requestContext) {
                             // Show detailed param info for debugging
                             val keyParams = buildString {
                                 append("关键参数:\n")
@@ -417,7 +485,7 @@ class CourseListFragment : Fragment() {
                                 append("• xkxqm: ${mergedParams["xkxqm"] ?: "缺失"}\n")
                             }
                             showErrorDialog("响应为空", "服务器返回空数据。\n\n$keyParams\n\n可能原因:\n1. 选课系统未开放\n2. 参数不正确")
-                            fetchNextCategory(school)
+                            fetchNextCategory(school, requestContext)
                         }
                         return
                     }
@@ -431,7 +499,7 @@ class CourseListFragment : Fragment() {
                             displayParams
                         )
                         
-                        activity?.runOnUiThread {
+                        runForRequestContext(requestContext) {
                             if (parsedCourses.isEmpty()) {
                                 // Check if JSON has error message
                                 val errorInfo = try {
@@ -468,13 +536,13 @@ class CourseListFragment : Fragment() {
                                 allCourses = allCourses + parsedCourses
                                 Log.d("CourseListFragment", "Parsed ${parsedCourses.size} courses from category ${tab.kklxdm}")
                             }
-                            fetchNextCategory(school)
+                            fetchNextCategory(school, requestContext)
                         }
                     } catch (e: Exception) {
                         Log.e("CourseListFragment", "Parse error: ${e.message}")
-                        activity?.runOnUiThread {
+                        runForRequestContext(requestContext) {
                             showErrorDialog("解析失败", "无法解析课程数据: ${e.message}\n\n响应预览: ${json.take(200)}")
-                            fetchNextCategory(school)
+                            fetchNextCategory(school, requestContext)
                         }
                     }
                 }
@@ -488,6 +556,8 @@ class CourseListFragment : Fragment() {
             Toast.makeText(context, "请先选择学校", Toast.LENGTH_SHORT).show()
             return
         }
+        if (isCourseSelectionBlocked(school)) return
+        val requestContext = newUiRequestContext(school)
 
         if (course.courseId.isNullOrEmpty()) {
             Toast.makeText(context, "缺少课程ID", Toast.LENGTH_SHORT).show()
@@ -507,9 +577,10 @@ class CourseListFragment : Fragment() {
 
         CourseApiClient.getInstance().fetchCourseSelectionDetails(
             school, course.courseId, xkkz_id, njdm_id, zyh_id, kklxdm, xqh_id, jg_id, rwlx, xklc,
+            requestContext,
             object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    activity?.runOnUiThread {
+                    runForRequestContext(requestContext) {
                         Toast.makeText(context, "获取选课详情失败: ${e.message}", Toast.LENGTH_SHORT).show()
                     }
                 }
@@ -519,13 +590,16 @@ class CourseListFragment : Fragment() {
                     val details = parseSelectionDetails(json)
 
                     if (details == null) {
-                        activity?.runOnUiThread {
+                        runForRequestContext(requestContext) {
                             Toast.makeText(context, "获取选课参数失败", Toast.LENGTH_SHORT).show()
                         }
                         return
                     }
 
-                    executeSelectionWithDetails(school, course, details, xkkz_id, njdm_id, zyh_id, rwlx, xklc)
+                    if (!isRequestCurrent(requestContext)) return
+                    executeSelectionWithDetails(
+                        school, course, details, xkkz_id, njdm_id, zyh_id, rwlx, xklc, requestContext
+                    )
                 }
             }
         )
@@ -582,9 +656,10 @@ class CourseListFragment : Fragment() {
 
     private fun executeSelectionWithDetails(
         school: SchoolConfig, course: Course, details: SelectionDetails,
-        xkkz_id: String, njdm_id: String, zyh_id: String, rwlx: String, xklc: String
+        xkkz_id: String, njdm_id: String, zyh_id: String, rwlx: String, xklc: String,
+        requestContext: SessionRequestContext
     ) {
-        activity?.runOnUiThread {
+        runForRequestContext(requestContext) {
             Toast.makeText(context, "正在选课: ${course.name}", Toast.LENGTH_SHORT).show()
         }
 
@@ -625,9 +700,9 @@ class CourseListFragment : Fragment() {
         postBody.append("&xkxqm=").append(finalXkxqm)
         postBody.append("&jcxx_id=").append(details.jcxxId)
 
-        CourseApiClient.getInstance().selectCourse(school, postBody.toString(), object : Callback {
+        CourseApiClient.getInstance().selectCourse(school, postBody.toString(), requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                activity?.runOnUiThread {
+                runForRequestContext(requestContext) {
                     Toast.makeText(context, "请求失败: ${e.message}", Toast.LENGTH_SHORT).show()
                 }
             }
@@ -638,9 +713,10 @@ class CourseListFragment : Fragment() {
                 
                 if (success) {
                     // Step 3: Verify selection (like Web version)
-                    verifyCourseSelection(school, course)
+                    if (!isRequestCurrent(requestContext)) return
+                    verifyCourseSelection(school, course, requestContext)
                 } else {
-                    activity?.runOnUiThread {
+                    runForRequestContext(requestContext) {
                         if (result.contains("人数已满")) {
                             Toast.makeText(context, "❌ 选课失败：人数已满", Toast.LENGTH_SHORT).show()
                         } else if (result.contains("冲突")) {
@@ -656,17 +732,22 @@ class CourseListFragment : Fragment() {
     }
 
     // Step 3: Verify selection result (matching Web version's verifyCourseSelection)
-    private fun verifyCourseSelection(school: SchoolConfig, course: Course) {
+    private fun verifyCourseSelection(
+        school: SchoolConfig,
+        course: Course,
+        requestContext: SessionRequestContext
+    ) {
         val postBody = StringBuilder()
         courseParams?.forEach { (key, value) ->
             if (postBody.isNotEmpty()) postBody.append("&")
             postBody.append(key).append("=").append(value)
         }
 
-        CourseApiClient.getInstance().fetchSelectedCourses(school, postBody.toString(), object : Callback {
+        CourseApiClient.getInstance().fetchSelectedCourses(
+            school, postBody.toString(), requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 // Verification failed, but selection might have succeeded
-                activity?.runOnUiThread {
+                runForRequestContext(requestContext) {
                     Toast.makeText(context, "✅ 选课成功！(验证失败: ${e.message})", Toast.LENGTH_LONG).show()
                     loadCourses()
                 }
@@ -676,7 +757,7 @@ class CourseListFragment : Fragment() {
                 val json = response.body?.string() ?: ""
                 val verified = verifyCourseInList(json, course)
                 
-                activity?.runOnUiThread {
+                runForRequestContext(requestContext) {
                     if (verified) {
                         Toast.makeText(context, "✅ 选课成功！已验证", Toast.LENGTH_LONG).show()
                     } else {
@@ -719,6 +800,7 @@ class CourseListFragment : Fragment() {
     }
 
     private fun showAutoGrabDialog(course: Course) {
+        if (isCourseSelectionBlocked(UserManager.getInstance().currentSchool)) return
         val context = context ?: return
         AlertDialog.Builder(context)
             .setTitle("抢课Pro+")
@@ -733,17 +815,19 @@ class CourseListFragment : Fragment() {
 
     private fun startAutoGrab(course: Course) {
         val school = UserManager.getInstance().currentSchool ?: return
+        if (isCourseSelectionBlocked(school)) return
+        val requestContext = newUiRequestContext(school)
         
         SmartSelector.getInstance().setCourseParams(courseParams)
         SmartSelector.getInstance().setListener(object : SmartSelector.OnStatusUpdateListener {
             override fun onUpdate(message: String) {
-                activity?.runOnUiThread {
+                runForRequestContext(requestContext) {
                     Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
                 }
             }
 
             override fun onSuccess(courseName: String) {
-                activity?.runOnUiThread {
+                runForRequestContext(requestContext) {
                     Toast.makeText(context, "🎉 抢课成功：$courseName", Toast.LENGTH_LONG).show()
                     loadCourses()
                 }
@@ -771,8 +855,10 @@ class CourseListFragment : Fragment() {
             Toast.makeText(context, "请先选择学校", Toast.LENGTH_SHORT).show()
             return
         }
+        if (isCourseSelectionBlocked(school)) return
+        val requestContext = newUiRequestContext(school)
 
-        activity?.runOnUiThread {
+        runForRequestContext(requestContext) {
             isBatchSelecting = true
             Toast.makeText(context, "开始批量抢课，共 ${selectedCourses.size} 门课程", Toast.LENGTH_SHORT).show()
         }
@@ -783,12 +869,13 @@ class CourseListFragment : Fragment() {
             var failCount = 0
 
             for ((index, course) in selectedCourses.withIndex()) {
-                activity?.runOnUiThread {
+                if (!isRequestCurrent(requestContext)) return@Thread
+                runForRequestContext(requestContext) {
                     Toast.makeText(context, "正在抢课 (${index + 1}/${selectedCourses.size}): ${course.name}", Toast.LENGTH_SHORT).show()
                 }
 
                 try {
-                    val result = performSelectionSync(school, course)
+                    val result = performSelectionSync(school, course, requestContext)
                     if (result) {
                         successCount++
                         Log.d("BatchSelection", "✅ 选课成功: ${course.name}")
@@ -805,7 +892,7 @@ class CourseListFragment : Fragment() {
                 Thread.sleep(500)
             }
 
-            activity?.runOnUiThread {
+            runForRequestContext(requestContext) {
                 isBatchSelecting = false
                 val message = "批量抢课完成！成功: $successCount 门，失败: $failCount 门"
                 Toast.makeText(context, message, Toast.LENGTH_LONG).show()
@@ -817,7 +904,12 @@ class CourseListFragment : Fragment() {
     }
 
     // 同步执行单个选课（用于批量抢课）
-    private fun performSelectionSync(school: SchoolConfig, course: Course): Boolean {
+    private fun performSelectionSync(
+        school: SchoolConfig,
+        course: Course,
+        requestContext: SessionRequestContext
+    ): Boolean {
+        if (!isRequestCurrent(requestContext)) return false
         val xkkz_id = course._xkkz_id ?: courseParams?.get("xkkz_id") ?: ""
         val njdm_id = course.njdm_id ?: courseParams?.get("njdm_id") ?: "2024"
         val zyh_id = course.zyh_id ?: courseParams?.get("zyh_id") ?: ""
@@ -829,7 +921,8 @@ class CourseListFragment : Fragment() {
 
         // Step 1: 获取加密的 jxb_id
         val detailsResponse = CourseApiClient.getInstance().fetchCourseSelectionDetailsSync(
-            school, course.courseId ?: "", xkkz_id, njdm_id, zyh_id, kklxdm, xqh_id, jg_id, rwlx, xklc
+            school, course.courseId ?: "", xkkz_id, njdm_id, zyh_id, kklxdm, xqh_id, jg_id, rwlx, xklc,
+            requestContext
         )
         
         if (detailsResponse == null) {
@@ -881,7 +974,10 @@ class CourseListFragment : Fragment() {
         postBody.append("&xkxqm=").append(finalXkxqm)
         postBody.append("&jcxx_id=").append(details.jcxxId)
 
-        val selectResponse = CourseApiClient.getInstance().selectCourseSync(school, postBody.toString())
+        if (!isRequestCurrent(requestContext)) return false
+        val selectResponse = CourseApiClient.getInstance().selectCourseSync(
+            school, postBody.toString(), requestContext
+        )
         
         if (selectResponse == null) {
             Log.e("BatchSelection", "选课请求失败: ${course.name}")

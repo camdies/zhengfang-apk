@@ -8,10 +8,16 @@ import android.util.Log;
 import com.tyust.course.model.Course;
 import com.tyust.course.model.SchoolConfig;
 import com.tyust.course.network.CourseApiClient;
+import com.tyust.course.session.ScnuProtocolCapabilities;
+import com.tyust.course.session.SessionRegistry;
+import com.tyust.course.session.SessionRequestContext;
+import com.tyust.course.session.SessionRequestOwner;
+import com.tyust.course.session.SessionRequestPurpose;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 import okhttp3.Call;
 import okhttp3.Callback;
 import okhttp3.Response;
@@ -23,6 +29,7 @@ public class SmartSelector {
     private static final String PREFS_NAME = "smart_selector_prefs";
     private static final String KEY_TARGET_COURSE = "target_course_json";
     private static final String KEY_COURSE_QUEUE = "course_queue_json";
+    private static final AtomicLong NEXT_RUN_ID = new AtomicLong(0L);
 
     private String accountStorageKey() {
         return UserManager.getInstance().getCurrentAccountStorageKey();
@@ -33,7 +40,23 @@ public class SmartSelector {
     }
 
     private static SmartSelector instance;
-    private boolean isRunning = false;
+    private volatile boolean isRunning = false;
+    /**
+     * A selection run owns one immutable session snapshot.  Every request and
+     * deferred continuation must carry this object instead of rebuilding
+     * identity from whichever account happens to be active later.
+     */
+    private static final class SelectionRun {
+        final long id;
+        final SessionRequestContext requestContext;
+
+        SelectionRun(long id, SessionRequestContext requestContext) {
+            this.id = id;
+            this.requestContext = requestContext;
+        }
+    }
+
+    private volatile SelectionRun activeRun;
     private Handler handler = new Handler(Looper.getMainLooper());
     private int successCount = 0;
     private int failCount = 0;
@@ -60,6 +83,68 @@ public class SmartSelector {
     private int interval = 1500; // ms
     private int maxRetry = 100;
 
+    /**
+     * Course-selection endpoints for canonical SCNU remain closed until the
+     * separately authorized protocol-discovery phase supplies evidence.
+     */
+    private boolean rejectUnsupportedCourseSelection(SchoolConfig school) {
+        if (ScnuProtocolCapabilities.isCourseSelectionAllowed(school)) {
+            return false;
+        }
+        invalidateActiveRun();
+        log(ScnuProtocolCapabilities.unavailableMessage());
+        return true;
+    }
+
+    private SelectionRun beginSelectionRun(SchoolConfig school) {
+        SessionRequestContext requestContext = SessionRequestContext.forSchool(
+                school,
+                accountStorageKey(),
+                SessionRequestPurpose.GRAB_SERVICE,
+                SessionRequestOwner.BACKGROUND
+        );
+        SelectionRun run = new SelectionRun(NEXT_RUN_ID.incrementAndGet(), requestContext);
+        activeRun = run;
+        isRunning = true;
+        return run;
+    }
+
+    private void invalidateActiveRun() {
+        isRunning = false;
+        activeRun = null;
+    }
+
+    /**
+     * A callback is usable only while it belongs to the currently active
+     * logical selection run and its original account session still exists.
+     */
+    private boolean isCurrentRun(SelectionRun run) {
+        if (run == null || !isRunning || activeRun != run) {
+            return false;
+        }
+        if (!run.requestContext.isSnapshotCurrent(SessionRegistry.activeContextEpoch(), null)) {
+            return false;
+        }
+        return run.requestContext.getNormalizedAccountStorageKey().equals(
+                SessionRegistry.normalizeAccountKey(accountStorageKey())
+        );
+    }
+
+    private void postForCurrentRun(SelectionRun run, long delayMs, Runnable continuation) {
+        Runnable guarded = () -> {
+            if (isCurrentRun(run)) {
+                continuation.run();
+            } else {
+                Log.d(TAG, "Dropping stale SmartSelector continuation for run " + run.id);
+            }
+        };
+        if (delayMs > 0L) {
+            handler.postDelayed(guarded, delayMs);
+        } else {
+            handler.post(guarded);
+        }
+    }
+
     public interface OnStatusUpdateListener {
         void onUpdate(String message);
 
@@ -82,8 +167,10 @@ public class SmartSelector {
     }
 
     public void reloadForCurrentAccount() {
-        if (isRunning) {
+        if (isRunning || activeRun != null) {
             stop();
+        } else {
+            invalidateActiveRun();
         }
         this.targetCourse = null;
         this.courseQueue.clear();
@@ -299,6 +386,8 @@ public class SmartSelector {
     public void startWithQueue(SchoolConfig school) {
         if (isRunning)
             return;
+        if (rejectUnsupportedCourseSelection(school))
+            return;
         if (courseQueue.isEmpty()) {
             log("⚠️ 队列为空，无法启动");
             return;
@@ -309,14 +398,17 @@ public class SmartSelector {
         this.successCount = 0;
         this.failCount = 0;
 
-        processNextInQueue();
+        SelectionRun run = beginSelectionRun(school);
+        processNextInQueue(run);
     }
 
     // 处理队列中的下一门课程 (动态匹配模式)
-    private void processNextInQueue() {
+    private void processNextInQueue(SelectionRun run) {
+        if (!isCurrentRun(run))
+            return;
         if (currentQueueIndex >= courseQueue.size()) {
             log("🎉 队列中所有课程处理完成！成功: " + successCount + " 门");
-            isRunning = false;
+            invalidateActiveRun();
             return;
         }
 
@@ -326,24 +418,26 @@ public class SmartSelector {
         log("📋 开始抢第 " + (currentQueueIndex + 1) + "/" + courseQueue.size() + " 门: " + targetMatch.name);
 
         if (listener != null) {
-            handler.post(() -> listener.onQueueProgress(currentQueueIndex + 1, courseQueue.size(), targetMatch.name));
+            postForCurrentRun(run, 0L,
+                    () -> listener.onQueueProgress(currentQueueIndex + 1, courseQueue.size(), targetMatch.name));
         }
 
-        this.isRunning = true;
         // 使用动态匹配模式
-        findAndGrabCourse(targetMatch, currentSchool);
+        findAndGrabCourse(targetMatch, currentSchool, run);
     }
 
     // 动态搜索并抢课 (核心逻辑)
-    private void findAndGrabCourse(Course targetMatch, SchoolConfig school) {
-        if (!isRunning)
+    private void findAndGrabCourse(Course targetMatch, SchoolConfig school, SelectionRun run) {
+        if (!isCurrentRun(run))
+            return;
+        if (rejectUnsupportedCourseSelection(school))
             return;
 
         // 🔧 精确模式：直接使用保存的 classId，跳过搜索
         if (targetMatch.useExactMatch && targetMatch.classId != null && !targetMatch.classId.isEmpty()) {
             log("🔒 精确模式: 使用保存的ID直接选课");
             // 精确模式下直接获取教学班详情并选课
-            fetchDetailsWithExactClassId(targetMatch, school);
+            fetchDetailsWithExactClassId(targetMatch, school, run);
             return;
         }
 
@@ -364,17 +458,25 @@ public class SmartSelector {
             searchBody.append("&");
         searchBody.append("filter_list[0]=").append(targetMatch.name);
 
-        CourseApiClient.getInstance().fetchAvailableCourses(school, searchBody.toString(), new Callback() {
+        CourseApiClient.getInstance().fetchAvailableCourses(
+                school, searchBody.toString(), run.requestContext, new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
-                log("⚠️ 搜索课程失败: " + e.getMessage());
-                scheduleRetryOrNext(school, targetMatch);
+                postForCurrentRun(run, 0L, () -> {
+                    log("⚠️ 搜索课程失败: " + e.getMessage());
+                    scheduleRetryOrNext(school, targetMatch, run);
+                });
             }
 
             @Override
             public void onResponse(Call call, Response response) throws IOException {
-                String body = response.body() != null ? response.body().string() : "";
+                if (!isCurrentRun(run)) {
+                    response.close();
+                    return;
+                }
+                final String body = response.body() != null ? response.body().string() : "";
 
+                postForCurrentRun(run, 0L, () -> {
                 try {
                     // Step 2: 解析课程列表 - 🔧 兼容两种 JSON 格式
                     JSONArray items = null;
@@ -394,7 +496,7 @@ public class SmartSelector {
 
                     if (items == null || items.length() == 0) {
                         log("⚠️ 未找到课程: " + targetMatch.name);
-                        scheduleRetryOrNext(school, targetMatch);
+                        scheduleRetryOrNext(school, targetMatch, run);
                         return;
                     }
 
@@ -420,23 +522,26 @@ public class SmartSelector {
 
                     if (matchedCourse == null) {
                         log("⚠️ 课程名不匹配: " + targetMatch.name);
-                        scheduleRetryOrNext(school, targetMatch);
+                        scheduleRetryOrNext(school, targetMatch, run);
                         return;
                     }
 
                     // Step 3: 获取课程详情，匹配具体教学班
-                    fetchDetailsAndMatch(matchedCourse, targetMatch, school);
+                    fetchDetailsAndMatch(matchedCourse, targetMatch, school, run);
 
                 } catch (Exception e) {
                     log("⚠️ 解析课程列表失败: " + e.getMessage());
-                    scheduleRetryOrNext(school, targetMatch);
+                    scheduleRetryOrNext(school, targetMatch, run);
                 }
+                });
             }
         });
     }
 
     // 🔧 精确模式：直接使用保存的 classId 获取教学班详情
-    private void fetchDetailsWithExactClassId(Course targetCourse, SchoolConfig school) {
+    private void fetchDetailsWithExactClassId(Course targetCourse, SchoolConfig school, SelectionRun run) {
+        if (!isCurrentRun(run))
+            return;
         StringBuilder detailBody = new StringBuilder();
         if (courseParams != null) {
             for (Map.Entry<String, String> entry : courseParams.entrySet()) {
@@ -452,17 +557,25 @@ public class SmartSelector {
             detailBody.append("&xkkz_id=").append(targetCourse._xkkz_id);
         }
 
-        CourseApiClient.getInstance().fetchCourseSelectionDetails(school, detailBody.toString(), new Callback() {
+        CourseApiClient.getInstance().fetchCourseSelectionDetails(
+                school, detailBody.toString(), run.requestContext, new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
-                log("⚠️ 精确模式获取详情失败: " + e.getMessage());
-                scheduleRetryOrNext(school, targetCourse);
+                postForCurrentRun(run, 0L, () -> {
+                    log("⚠️ 精确模式获取详情失败: " + e.getMessage());
+                    scheduleRetryOrNext(school, targetCourse, run);
+                });
             }
 
             @Override
             public void onResponse(Call call, Response response) throws IOException {
-                String body = response.body() != null ? response.body().string() : "";
+                if (!isCurrentRun(run)) {
+                    response.close();
+                    return;
+                }
+                final String body = response.body() != null ? response.body().string() : "";
 
+                postForCurrentRun(run, 0L, () -> {
                 try {
                     JSONArray classes = new JSONArray(body);
                     Course matchedClass = null;
@@ -516,10 +629,10 @@ public class SmartSelector {
                     if (matchedClass != null) {
                         // 执行选课（与 fetchDetailsAndMatch 一致的调用方式）
                         SmartSelector.this.targetCourse = matchedClass;
-                        runLoop(school);
+                        runLoop(school, run);
                     } else {
                         log("❌ 未找到可选教学班");
-                        scheduleRetryOrNext(school, targetCourse);
+                        scheduleRetryOrNext(school, targetCourse, run);
                     }
 
                 } catch (Exception e) {
@@ -540,18 +653,26 @@ public class SmartSelector {
                             targetCourse.xxkbj = "0";
 
                         SmartSelector.this.targetCourse = targetCourse;
-                        runLoop(school);
+                        runLoop(school, run);
                         return;
                     }
 
-                    scheduleRetryOrNext(school, targetCourse);
+                    scheduleRetryOrNext(school, targetCourse, run);
                 }
+                });
             }
         });
     }
 
     // 获取课程详情并匹配教学班
-    private void fetchDetailsAndMatch(Course baseCourse, Course targetMatch, SchoolConfig school) {
+    private void fetchDetailsAndMatch(
+            Course baseCourse,
+            Course targetMatch,
+            SchoolConfig school,
+            SelectionRun run
+    ) {
+        if (!isCurrentRun(run))
+            return;
         StringBuilder detailBody = new StringBuilder();
         if (courseParams != null) {
             for (Map.Entry<String, String> entry : courseParams.entrySet()) {
@@ -565,17 +686,25 @@ public class SmartSelector {
         detailBody.append("kch_id=").append(baseCourse.courseId);
         detailBody.append("&xkkz_id=").append(baseCourse._xkkz_id);
 
-        CourseApiClient.getInstance().fetchCourseSelectionDetails(school, detailBody.toString(), new Callback() {
+        CourseApiClient.getInstance().fetchCourseSelectionDetails(
+                school, detailBody.toString(), run.requestContext, new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
-                log("⚠️ 获取课程详情失败: " + e.getMessage());
-                scheduleRetryOrNext(school, targetMatch);
+                postForCurrentRun(run, 0L, () -> {
+                    log("⚠️ 获取课程详情失败: " + e.getMessage());
+                    scheduleRetryOrNext(school, targetMatch, run);
+                });
             }
 
             @Override
             public void onResponse(Call call, Response response) throws IOException {
-                String body = response.body() != null ? response.body().string() : "";
+                if (!isCurrentRun(run)) {
+                    response.close();
+                    return;
+                }
+                final String body = response.body() != null ? response.body().string() : "";
 
+                postForCurrentRun(run, 0L, () -> {
                 try {
                     JSONArray classes = new JSONArray(body);
                     Course matchedClass = null;
@@ -613,32 +742,35 @@ public class SmartSelector {
 
                     if (matchedClass == null) {
                         log("⚠️ 未匹配到符合条件的教学班");
-                        scheduleRetryOrNext(school, targetMatch);
+                        scheduleRetryOrNext(school, targetMatch, run);
                         return;
                     }
 
                     // Step 4: 使用动态获取的参数执行选课
                     targetCourse = matchedClass;
-                    runLoop(school);
+                    runLoop(school, run);
 
                 } catch (Exception e) {
                     log("⚠️ 解析课程详情失败: " + e.getMessage());
-                    scheduleRetryOrNext(school, targetMatch);
+                    scheduleRetryOrNext(school, targetMatch, run);
                 }
+                });
             }
         });
     }
 
     // 重试或切换到下一门课程
-    private void scheduleRetryOrNext(SchoolConfig school, Course targetMatch) {
+    private void scheduleRetryOrNext(SchoolConfig school, Course targetMatch, SelectionRun run) {
+        if (!isCurrentRun(run))
+            return;
         retryCount++;
         if (retryCount >= maxRetry) {
             log("⚠️ " + targetMatch.name + " 达到最大重试次数，切换下一门");
             currentQueueIndex++;
-            handler.postDelayed(() -> processNextInQueue(), interval);
+            postForCurrentRun(run, interval, () -> processNextInQueue(run));
         } else {
             log("⏳ 重试 [" + retryCount + "/" + maxRetry + "] " + targetMatch.name);
-            handler.postDelayed(() -> findAndGrabCourse(targetMatch, school), interval);
+            postForCurrentRun(run, interval, () -> findAndGrabCourse(targetMatch, school, run));
         }
     }
 
@@ -787,19 +919,21 @@ public class SmartSelector {
     public void start(Course course, SchoolConfig school) {
         if (isRunning)
             return;
+        if (rejectUnsupportedCourseSelection(school))
+            return;
         this.targetCourse = course;
         this.currentSchool = school;
-        this.isRunning = true;
         this.successCount = 0;
         this.failCount = 0;
         this.retryCount = 0;
+        SelectionRun run = beginSelectionRun(school);
 
         log("🚀 开始抢课: " + course.name);
-        runLoop(school);
+        runLoop(school, run);
     }
 
     public void stop() {
-        isRunning = false;
+        invalidateActiveRun();
         log("⏹ 抢课已停止");
     }
 
@@ -807,8 +941,10 @@ public class SmartSelector {
         return isRunning;
     }
 
-    private void runLoop(SchoolConfig school) {
-        if (!isRunning)
+    private void runLoop(SchoolConfig school, SelectionRun run) {
+        if (!isCurrentRun(run))
+            return;
+        if (rejectUnsupportedCourseSelection(school))
             return;
 
         if (retryCount >= maxRetry) {
@@ -816,11 +952,11 @@ public class SmartSelector {
             if (!courseQueue.isEmpty() && currentQueueIndex < courseQueue.size()) {
                 log("⚠️ 达到最大重试次数，切换到下一门课程");
                 currentQueueIndex++;
-                processNextInQueue();
+                processNextInQueue(run);
                 return;
             }
 
-            isRunning = false;
+            invalidateActiveRun();
             log("❌ 已达到最大重试次数 (" + maxRetry + ")，自动停止");
             return;
         }
@@ -871,18 +1007,26 @@ public class SmartSelector {
         Log.d(TAG, "Auto-select POST body: " + postBody.toString());
         retryCount++;
 
-        CourseApiClient.getInstance().selectCourse(school, postBody.toString(), new Callback() {
+        CourseApiClient.getInstance().selectCourse(
+                school, postBody.toString(), run.requestContext, new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
-                failCount++;
-                log("⚠️ 请求失败: " + e.getMessage() + " [" + retryCount + "/" + maxRetry + "]");
-                scheduleNext(school);
+                postForCurrentRun(run, 0L, () -> {
+                    failCount++;
+                    log("⚠️ 请求失败: " + e.getMessage() + " [" + retryCount + "/" + maxRetry + "]");
+                    scheduleNext(school, run);
+                });
             }
 
             @Override
             public void onResponse(Call call, Response response) throws IOException {
+                if (!isCurrentRun(run)) {
+                    response.close();
+                    return;
+                }
+                final String html = response.body() != null ? response.body().string() : "";
+                postForCurrentRun(run, 0L, () -> {
                 try {
-                    String html = response.body().string();
                     Log.d(TAG, "Selection response: " + html);
 
                     // 尝试解析JSON响应 (与Web版一致)
@@ -919,7 +1063,12 @@ public class SmartSelector {
                         log("✅ " + msg + ": " + targetCourse.name);
 
                         if (listener != null) {
-                            handler.post(() -> listener.onSuccess(targetCourse.name));
+                            // This response is already executing on the
+                            // main-handler continuation protected by `run`.
+                            // Notify before a terminal success invalidates
+                            // that run, otherwise a queued listener callback
+                            // would be discarded as stale.
+                            listener.onSuccess(targetCourse.name);
                         }
 
                         // 队列模式：成功后处理下一门
@@ -927,29 +1076,30 @@ public class SmartSelector {
                             // 从队列中移除已成功的课程
                             removeFromQueue(targetCourse);
                             // 不递增 index，因为已经移除了当前课程
-                            handler.postDelayed(() -> processNextInQueue(), 2000); // 等待2秒后继续
+                            postForCurrentRun(run, 2000L, () -> processNextInQueue(run));
                         } else {
-                            isRunning = false;
+                            invalidateActiveRun();
                         }
                     } else {
                         failCount++;
                         log("❌ " + msg + " [" + retryCount + "/" + maxRetry + "]");
-                        scheduleNext(school);
+                        scheduleNext(school, run);
                     }
                 } catch (Exception e) {
                     failCount++;
                     Log.e(TAG, "Error processing response: " + e.getMessage());
-                    scheduleNext(school);
+                    scheduleNext(school, run);
                 }
+                });
             }
         });
     }
 
-    private void scheduleNext(SchoolConfig school) {
-        if (!isRunning)
+    private void scheduleNext(SchoolConfig school, SelectionRun run) {
+        if (!isCurrentRun(run))
             return;
         // 使用配置的间隔时间
-        handler.postDelayed(() -> runLoop(school), interval);
+        postForCurrentRun(run, interval, () -> runLoop(school, run));
     }
 
     private void log(String msg) {

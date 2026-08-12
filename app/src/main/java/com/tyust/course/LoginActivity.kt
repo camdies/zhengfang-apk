@@ -21,9 +21,16 @@ import com.tyust.course.ui.screen.SchoolAdaptationCompletionReminder
 import com.tyust.course.ui.screen.SchoolAdaptationFlow
 import com.tyust.course.ui.theme.CourseSelectorTheme
 import com.tyust.course.utils.CourseParser
-import com.tyust.course.login.PasswordLoginCallback
-import com.tyust.course.login.PasswordLoginGateway
-import com.tyust.course.login.PasswordLoginGatewayFactory
+import com.tyust.course.session.CoordinatorCallback
+import com.tyust.course.session.ScnuProtocolCapabilities
+import com.tyust.course.session.SessionInstallResult
+import com.tyust.course.session.SessionInstallTarget
+import com.tyust.course.session.SessionRequestContext
+import com.tyust.course.session.SessionRequestOwner
+import com.tyust.course.session.SessionRequestPurpose
+import com.tyust.course.session.SessionRefreshCoordinator
+import com.tyust.course.session.SessionRegistry
+import com.tyust.course.session.SessionState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -53,10 +60,15 @@ class LoginActivity : ComponentActivity() {
     private var pendingPasswordLogin by mutableStateOf(false)
 
     // Password Login State
-    private var activePasswordLoginGateway: PasswordLoginGateway? = null
+    private val sessionRefreshCoordinator: SessionRefreshCoordinator by lazy {
+        UserManager.getInstance().sessionRefreshCoordinator
+    }
+    private var activePasswordLoginAccountStorageKey: String? = null
     private var pendingPasswordSchool: SchoolConfig? = null
     private var pendingPasswordUsername = ""
     private var pendingPasswordValue = ""
+    private var pendingInstalledTarget: SessionInstallTarget? = null
+    private var pendingInstalledGeneration: Long? = null
     private var captchaImageBytes by mutableStateOf<ByteArray?>(null)
 
     // WebView result launcher
@@ -117,7 +129,7 @@ class LoginActivity : ComponentActivity() {
                     
                     // 2. 如果加载后依然没选中任何学校（比如第一次用），才选第一个
                     if (schools.isNotEmpty() && userManager.currentSchool == null) {
-                        userManager.currentSchool = schools[0]
+                        userManager.setCurrentSchool(schools[0])
                     }
                 }
                 
@@ -130,7 +142,7 @@ class LoginActivity : ComponentActivity() {
                     LoginScreen(
                     schools = schools,
                     onSchoolSelected = { school ->
-                        UserManager.getInstance().currentSchool = school
+                        UserManager.getInstance().setCurrentSchool(school)
                     },
                     onLoginClick = { cookie ->
                         handleLogin(cookie)
@@ -174,11 +186,17 @@ class LoginActivity : ComponentActivity() {
                             studentName = bindingStudentName,
                             studentId = bindingStudentId
                         )
-                        proceedToMain(UserManager.getInstance(), bindingStudentName, pendingCookie)
+                        proceedToMain(
+                            UserManager.getInstance(),
+                            bindingStudentName,
+                            pendingCookie,
+                            pendingInstalledTarget,
+                            pendingInstalledGeneration
+                        )
                     },
                     onCancelBinding = {
                         showBindingDialog = false
-                        discardPendingPasswordLogin()
+                        discardPendingPasswordLogin(clearInstalledSession = true)
                         errorMessage = "已取消，账号未绑定"
                     }
                 )
@@ -198,14 +216,8 @@ class LoginActivity : ComponentActivity() {
     private fun checkSavedLoginState() {
         val userManager = UserManager.getInstance()
         
-        if (userManager.hasSavedCookie() && userManager.currentSchool != null) {
-            Log.d(TAG, "发现保存的 Cookie，直接进入主页面")
-            
-            val savedCookie = userManager.savedCookie
-            val currentSchool = userManager.currentSchool
-            
-            // 设置 Cookie 到 API Client
-            CourseApiClient.getInstance().setCookie(currentSchool.baseUrl, savedCookie)
+        if (userManager.hasRestorableSession() && userManager.currentSchool != null) {
+            Log.d(TAG, "发现可恢复的类型化会话，直接进入主页面")
             
             // 直接跳转到主页面，不验证 Cookie
             userManager.isLoggedIn = true
@@ -246,7 +258,7 @@ class LoginActivity : ComponentActivity() {
         
         // 如果没有选择学校，使用第一个
         if (userManager.currentSchool == null && userManager.supportedSchools.isNotEmpty()) {
-            userManager.currentSchool = userManager.supportedSchools[0]
+            userManager.setCurrentSchool(userManager.supportedSchools[0])
         }
         
         Toast.makeText(this, "🎮 已进入演示模式", Toast.LENGTH_SHORT).show()
@@ -256,7 +268,7 @@ class LoginActivity : ComponentActivity() {
     }
 
     private fun handleLogin(cookieStr: String) {
-        discardPendingPasswordLogin()
+        discardPostInstallFailure()
         val currentSchool = UserManager.getInstance().currentSchool
         if (currentSchool == null) {
             errorMessage = "请先选择学校"
@@ -265,6 +277,10 @@ class LoginActivity : ComponentActivity() {
 
         if (cookieStr.isBlank()) {
             errorMessage = "请输入 Cookie"
+            return
+        }
+        if (ScnuProtocolCapabilities.isCanonicalScnu(currentSchool)) {
+            errorMessage = "SCNU 登录协议尚未验证，不能使用扁平 Cookie 登录"
             return
         }
 
@@ -289,17 +305,65 @@ class LoginActivity : ComponentActivity() {
         }
     }
     
-    private fun performLoginValidation(currentSchool: SchoolConfig, cookieStr: String) {
+    private fun performLoginValidation(
+        currentSchool: SchoolConfig,
+        cookieStr: String = "",
+        installedTarget: SessionInstallTarget? = null,
+        installedGeneration: Long? = null
+    ) {
+        // Canonical SCNU is closed to flat-header validation. A structured
+        // SSO login already carries an installedTarget (RFC bundle); only
+        // the legacy Cookie-string path must be blocked here.
+        if (ScnuProtocolCapabilities.isCanonicalScnu(currentSchool) &&
+            installedTarget == null
+        ) {
+            isLoading = false
+            discardPostInstallFailure()
+            errorMessage = "SCNU 登录协议尚未验证，不能使用扁平 Cookie 登录"
+            return
+        }
         // 1. Set Cookie
-        CourseApiClient.getInstance().setCookie(currentSchool.baseUrl, cookieStr.trim())
+        if (installedTarget != null && installedGeneration != null &&
+            !isInstalledTargetCurrent(installedTarget, installedGeneration)
+        ) {
+            isLoading = false
+            errorMessage = "账号已切换，本次登录已取消"
+            discardPostInstallFailure()
+            return
+        }
+        if (installedTarget == null || installedGeneration == null) {
+            if (!CourseApiClient.getInstance().setLegacyCookie(
+                currentSchool,
+                cookieStr.trim(),
+                UserManager.getInstance().currentAccountStorageKey
+            )) {
+                isLoading = false
+                errorMessage = "当前学校不支持扁平 Cookie 会话"
+                return
+            }
+        }
+
+        // This UI-owned snapshot is deliberately captured before dispatch. A
+        // late response from a switched account/school must be discarded.
+        val validationContext = SessionRequestContext.forSchool(
+            currentSchool,
+            installedTarget?.accountStorageKey ?: UserManager.getInstance().currentAccountStorageKey,
+            SessionRequestPurpose.SESSION_PROBE,
+            SessionRequestOwner.UI
+        )
 
         // 2. Validate Cookie
-        CourseApiClient.getInstance().validateCookie(currentSchool, object : Callback {
+        CourseApiClient.getInstance().validateCookie(currentSchool, validationContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 runOnUiThread {
                     isLoading = false
+                    if (!validationContext.isSnapshotCurrent()) {
+                        errorMessage = "账号已切换，本次登录已取消"
+                        discardPostInstallFailure()
+                        return@runOnUiThread
+                    }
                     errorMessage = "网络请求失败: ${e.message}"
-                    discardPendingPasswordLogin()
+                    discardPostInstallFailure()
                 }
             }
 
@@ -323,11 +387,19 @@ class LoginActivity : ComponentActivity() {
 
                 runOnUiThread {
                     isLoading = false
+                    if (!validationContext.isSnapshotCurrent() ||
+                        (installedTarget != null && installedGeneration != null &&
+                            !isInstalledTargetCurrent(installedTarget, installedGeneration))
+                    ) {
+                        errorMessage = "账号已切换，本次登录已取消"
+                        discardPostInstallFailure()
+                        return@runOnUiThread
+                    }
                     if (success) {
                         val userManager = UserManager.getInstance()
                         if (userManager.currentSchool?.id != currentSchool.id) {
                             errorMessage = "学校已切换，请重新登录"
-                            discardPendingPasswordLogin()
+                            discardPostInstallFailure()
                             return@runOnUiThread
                         }
                         val studentNameParsed = name ?: "同学"
@@ -351,7 +423,7 @@ class LoginActivity : ComponentActivity() {
 
                         if (!bindingCheck.allowed) {
                             errorMessage = bindingCheck.reason
-                            discardPendingPasswordLogin()
+                            discardPostInstallFailure()
                             return@runOnUiThread
                         }
 
@@ -366,7 +438,13 @@ class LoginActivity : ComponentActivity() {
                                     studentId = studentIdParsed
                                 )
                             }
-                            proceedToMain(userManager, studentNameParsed, cookieStr)
+                            proceedToMain(
+                                userManager,
+                                studentNameParsed,
+                                cookieStr,
+                                installedTarget,
+                                installedGeneration
+                            )
                             return@runOnUiThread
                         }
 
@@ -375,10 +453,12 @@ class LoginActivity : ComponentActivity() {
                         bindingMaxStudents = maxStudents
                         bindingUsedNames = bindingCheck.usedNames
                         pendingCookie = cookieStr
+                        pendingInstalledTarget = installedTarget
+                        pendingInstalledGeneration = installedGeneration
                         showBindingDialog = true
 
                     } else {
-                        discardPendingPasswordLogin()
+                        discardPostInstallFailure()
                         errorMessage = if (isLoginPage) {
                             "Cookie 已过期或无效，请重新获取"
                         } else {
@@ -393,12 +473,25 @@ class LoginActivity : ComponentActivity() {
     /**
      * 登录成功后进入主界面
      */
-    private fun proceedToMain(userManager: UserManager, studentName: String, cookieStr: String) {
+    private fun proceedToMain(
+        userManager: UserManager,
+        studentName: String,
+        cookieStr: String,
+        installedTarget: SessionInstallTarget? = null,
+        installedGeneration: Long? = null
+    ) {
         if (pendingPasswordLogin) {
+            if (installedTarget != null && installedGeneration != null &&
+                !isInstalledTargetCurrent(installedTarget, installedGeneration)
+            ) {
+                errorMessage = "账号已切换，本次登录已取消"
+                discardPostInstallFailure()
+                return
+            }
             val passwordSchool = pendingPasswordSchool
             if (passwordSchool == null || userManager.currentSchool?.id != passwordSchool.id) {
                 errorMessage = "学校已切换，请重新登录"
-                discardPendingPasswordLogin()
+                discardPostInstallFailure()
                 return
             }
         }
@@ -407,11 +500,23 @@ class LoginActivity : ComponentActivity() {
         
         // 保存 Cookie 用于下次自动登录
         if (pendingPasswordLogin) {
-            userManager.savePasswordLogin(
-                pendingPasswordUsername,
-                cookieStr.trim(),
-                pendingPasswordValue
-            )
+            if (installedTarget != null) {
+                if (!userManager.completePasswordLogin(
+                        installedTarget,
+                        pendingPasswordUsername,
+                        pendingPasswordValue
+                    )) {
+                    errorMessage = "账号已切换，本次登录已取消"
+                    discardPostInstallFailure()
+                    return
+                }
+            } else {
+                userManager.savePasswordLogin(
+                    pendingPasswordUsername,
+                    cookieStr.trim(),
+                    pendingPasswordValue
+                )
+            }
         } else {
             userManager.saveCookieLogin(cookieStr.trim())
         }
@@ -431,8 +536,8 @@ class LoginActivity : ComponentActivity() {
     // ============ 密码登录 ============
 
     private fun handlePasswordLogin(username: String, password: String) {
-        val school = UserManager.getInstance().currentSchool
-        Log.d(TAG, "handlePasswordLogin: school=${school?.name}, baseUrl=${school?.getBaseUrl()}, fullPath=${school?.getFullBasePath()}")
+        val userManager = UserManager.getInstance()
+        val school = userManager.currentSchool
         if (school == null) {
             errorMessage = "请先选择学校"
             return
@@ -442,172 +547,186 @@ class LoginActivity : ComponentActivity() {
             return
         }
 
+        discardPostInstallFailure()
+        val accountStorageKey = userManager.preparePasswordLoginAccount(school, username)
+        if (accountStorageKey.isBlank()) {
+            errorMessage = "学校已切换，请重新登录"
+            return
+        }
         isLoading = true
         errorMessage = null
         captchaImageBytes = null
-
         pendingPasswordUsername = username
         pendingPasswordValue = password
         pendingPasswordSchool = school
-        activePasswordLoginGateway?.clearSensitiveState()
-        val gateway = PasswordLoginGatewayFactory.create(school)
-        activePasswordLoginGateway = gateway
+        activePasswordLoginAccountStorageKey = accountStorageKey
+        sessionRefreshCoordinator.beginLogin(
+            school,
+            accountStorageKey,
+            username,
+            password,
+            passwordCoordinatorCallback(school)
+        )
+    }
 
-        gateway.login(school, username, password, object : PasswordLoginCallback {
-            override fun onSuccess(cookie: String) {
-                runOnUiThread {
-                    if (UserManager.getInstance().currentSchool?.id != school.id) {
+    private fun passwordCoordinatorCallback(school: SchoolConfig): CoordinatorCallback = object : CoordinatorCallback {
+        override fun onInstalled(target: SessionInstallTarget, result: SessionInstallResult) {
+            runOnUiThread {
+                when (result) {
+                    is SessionInstallResult.InstalledActive -> {
+                        if (!isInstalledTargetCurrent(target, result.snapshot.generation)) {
+                            isLoading = false
+                            errorMessage = "账号已切换，本次登录已取消"
+                            discardPendingPasswordLogin()
+                            return@runOnUiThread
+                        }
                         isLoading = false
-                        errorMessage = "学校已切换，请重新登录"
-                        discardPendingPasswordLogin()
-                        return@runOnUiThread
-                    }
-                    gateway.clearSensitiveState()
-                    isLoading = false
-                    Log.d(TAG, "密码登录成功")
-                    pendingPasswordLogin = true
-                    // 复用现有验证流程
-                    lifecycleScope.launch {
-                        try {
-                            withContext(Dispatchers.IO) {
-                                com.tyust.course.activation.ActivationManager.checkActivation(this@LoginActivity)
+                        captchaImageBytes = null
+                        pendingPasswordLogin = true
+                        pendingInstalledTarget = target
+                        pendingInstalledGeneration = result.snapshot.generation
+                        lifecycleScope.launch {
+                            try {
+                                withContext(Dispatchers.IO) {
+                                    com.tyust.course.activation.ActivationManager.checkActivation(this@LoginActivity)
+                                }
+                            } catch (_: Exception) {
                             }
-                        } catch (_: Exception) {}
-                        performLoginValidation(school, cookie)
+                            performLoginValidation(school, "", target, result.snapshot.generation)
+                        }
+                    }
+                    is SessionInstallResult.InstalledInactive,
+                    SessionInstallResult.StaleTarget -> {
+                        isLoading = false
+                        captchaImageBytes = null
+                        errorMessage = "账号已切换，本次登录已取消"
+                        discardPendingPasswordLogin()
+                    }
+                    SessionInstallResult.InvalidScope -> {
+                        isLoading = false
+                        errorMessage = "登录会话作用域无效，请重新登录"
+                        discardPendingPasswordLogin()
+                    }
+                    SessionInstallResult.UnsupportedArtifact -> {
+                        isLoading = false
+                        errorMessage = "当前登录结果尚不受支持"
+                        discardPendingPasswordLogin()
                     }
                 }
             }
+        }
 
-            override fun onCaptchaRequired(imageBytes: ByteArray) {
-                runOnUiThread {
-                    isLoading = false
-                    captchaImageBytes = imageBytes
-                    Log.d(TAG, "Captcha received: ${imageBytes.size} bytes, dialog should show")
-                }
+        override fun onJoinInFlight(target: SessionInstallTarget) {
+            runOnUiThread {
+                isLoading = false
+                errorMessage = "该账号正在登录，请稍候"
+                clearPendingPasswordLoginState()
             }
+        }
 
-            override fun onCaptchaInvalid() {
-                runOnUiThread {
-                    isLoading = false
-                    errorMessage = "验证码错误，请重新输入"
-                    refreshCaptcha()
-                }
+        override fun onCaptchaRequired(target: SessionInstallTarget, imageBytes: ByteArray) {
+            runOnUiThread {
+                if (activePasswordLoginAccountStorageKey != target.accountStorageKey) return@runOnUiThread
+                isLoading = false
+                captchaImageBytes = imageBytes
             }
+        }
 
-            override fun onInvalidCredentials() {
-                runOnUiThread {
-                    isLoading = false
-                    errorMessage = "用户名或密码不正确"
-                    discardPendingPasswordLogin()
-                    Log.d(TAG, "onInvalidCredentials called")
-                }
+        override fun onCaptchaInvalid(target: SessionInstallTarget) {
+            runOnUiThread {
+                if (activePasswordLoginAccountStorageKey != target.accountStorageKey) return@runOnUiThread
+                isLoading = false
+                errorMessage = "验证码错误，请重新输入"
+                refreshCaptcha()
             }
+        }
 
-            override fun onError(message: String) {
-                runOnUiThread {
-                    isLoading = false
-                    errorMessage = message
-                    discardPendingPasswordLogin()
-                    Log.e(TAG, "onError called: $message")
-                }
+        override fun onInvalidCredentials(target: SessionInstallTarget) {
+            runOnUiThread {
+                isLoading = false
+                captchaImageBytes = null
+                errorMessage = "用户名或密码不正确"
+                discardPendingPasswordLogin()
             }
-        })
+        }
+
+        override fun onError(target: SessionInstallTarget?, message: String) {
+            runOnUiThread {
+                isLoading = false
+                captchaImageBytes = null
+                errorMessage = message
+                discardPendingPasswordLogin()
+            }
+        }
     }
 
     private fun handleCaptchaSubmit(code: String) {
-        isLoading = true
-        errorMessage = null
-        // 不清除 captchaImageBytes，保持弹窗可见直到收到响应
-
-        val gateway = activePasswordLoginGateway
-        if (gateway == null) {
+        val accountStorageKey = activePasswordLoginAccountStorageKey
+        val school = pendingPasswordSchool
+        if (accountStorageKey.isNullOrBlank() || school == null) {
             isLoading = false
             errorMessage = "登录会话已失效，请重新登录"
             return
         }
-        gateway.submitCaptcha(code, object : PasswordLoginCallback {
-            override fun onSuccess(cookie: String) {
-                Log.d(TAG, "Captcha submit: login SUCCESS")
-                runOnUiThread {
-                    gateway.clearSensitiveState()
-                    isLoading = false
-                    captchaImageBytes = null  // 成功时清除
-                    val school = pendingPasswordSchool
-                    if (school == null || UserManager.getInstance().currentSchool?.id != school.id) {
-                        errorMessage = "学校已切换，请重新登录"
-                        discardPendingPasswordLogin()
-                        return@runOnUiThread
-                    }
-                    pendingPasswordLogin = true
-                    lifecycleScope.launch {
-                        try {
-                            withContext(Dispatchers.IO) {
-                                com.tyust.course.activation.ActivationManager.checkActivation(this@LoginActivity)
-                            }
-                        } catch (_: Exception) {}
-                        performLoginValidation(school, cookie)
-                    }
-                }
-            }
-
-            override fun onCaptchaRequired(imageBytes: ByteArray) {
-                Log.d(TAG, "Captcha submit: server returned new captcha, size=${imageBytes.size}")
-                runOnUiThread {
-                    isLoading = false
-                    captchaImageBytes = imageBytes  // 刷新图片
-                }
-            }
-
-            override fun onCaptchaInvalid() {
-                Log.d(TAG, "Captcha submit: captcha INVALID")
-                runOnUiThread {
-                    isLoading = false
-                    errorMessage = "验证码错误，请重新输入"
-                    refreshCaptcha()
-                }
-            }
-
-            override fun onInvalidCredentials() {
-                Log.d(TAG, "Captcha submit: INVALID credentials")
-                runOnUiThread {
-                    isLoading = false
-                    errorMessage = "用户名或密码不正确"
-                    captchaImageBytes = null
-                    discardPendingPasswordLogin()
-                }
-            }
-
-            override fun onError(message: String) {
-                Log.e(TAG, "Captcha submit error: $message")
-                runOnUiThread {
-                    isLoading = false
-                    captchaImageBytes = null
-                    errorMessage = message
-                    discardPendingPasswordLogin()
-                }
-            }
-        })
+        isLoading = true
+        errorMessage = null
+        sessionRefreshCoordinator.submitCaptcha(
+            accountStorageKey,
+            code,
+            passwordCoordinatorCallback(school)
+        )
     }
 
     private fun refreshCaptcha() {
-        activePasswordLoginGateway?.refreshCaptcha { bytes ->
+        val accountStorageKey = activePasswordLoginAccountStorageKey ?: return
+        sessionRefreshCoordinator.refreshCaptcha(accountStorageKey) { bytes ->
             runOnUiThread {
                 if (bytes != null) captchaImageBytes = bytes
             }
         }
     }
 
-    private fun discardPendingPasswordLogin() {
-        activePasswordLoginGateway?.clearSensitiveState()
-        activePasswordLoginGateway = null
+    private fun isInstalledTargetCurrent(target: SessionInstallTarget, generation: Long): Boolean {
+        val userManager = UserManager.getInstance()
+        val school = userManager.currentSchool ?: return false
+        return com.tyust.course.session.SchoolSessionScope.fromSchool(school) == target.schoolScope &&
+            userManager.currentAccountStorageKey == target.accountStorageKey &&
+            SessionRegistry.snapshot(target.accountStorageKey).let {
+                it.generation == generation && it.state == SessionState.ACTIVE
+            }
+    }
+
+    private fun discardPendingPasswordLogin(clearInstalledSession: Boolean = false) {
+        val target = pendingInstalledTarget
+        val generation = pendingInstalledGeneration
+        val accountStorageKey = activePasswordLoginAccountStorageKey
+        if (!accountStorageKey.isNullOrBlank()) {
+            sessionRefreshCoordinator.cancel(accountStorageKey)
+        }
+        if (clearInstalledSession && target != null && generation != null &&
+            isInstalledTargetCurrent(target, generation)
+        ) {
+            UserManager.getInstance().clearLoginState()
+        }
+        clearPendingPasswordLoginState()
+    }
+
+    private fun discardPostInstallFailure() {
+        discardPendingPasswordLogin(clearInstalledSession = pendingInstalledTarget != null)
+    }
+
+    private fun clearPendingPasswordLoginState() {
+        activePasswordLoginAccountStorageKey = null
         pendingPasswordSchool = null
         pendingPasswordUsername = ""
         pendingPasswordValue = ""
         pendingPasswordLogin = false
+        pendingInstalledTarget = null
+        pendingInstalledGeneration = null
     }
 
     override fun onDestroy() {
-        discardPendingPasswordLogin()
+        discardPostInstallFailure()
         super.onDestroy()
     }
 }

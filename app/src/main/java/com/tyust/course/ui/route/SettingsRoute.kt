@@ -34,10 +34,13 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import com.tyust.course.LoginActivity
-import com.tyust.course.login.PasswordLoginCallback
-import com.tyust.course.login.PasswordLoginGatewayFactory
 import com.tyust.course.manager.UserManager
-import com.tyust.course.network.CourseApiClient
+import com.tyust.course.session.CoordinatorCallback
+import com.tyust.course.session.SchoolSessionScope
+import com.tyust.course.session.SessionInstallResult
+import com.tyust.course.session.SessionInstallTarget
+import com.tyust.course.session.SessionRegistry
+import com.tyust.course.session.SessionState
 import com.tyust.course.ui.screen.SettingsScreen
 import com.tyust.course.ui.screen.SchoolAdaptationFlow
 import com.tyust.course.update.UpdateManager
@@ -218,78 +221,103 @@ fun SettingsRoute(
         }
 
         val requestAccountKey = userManager.currentAccountStorageKey
-        val requestSchoolId = school.id
         val requestUsername = userManager.username
         val requestPassword = userManager.sessionPassword
+        val coordinator = userManager.sessionRefreshCoordinator
         isRefreshingCookie = true
-        val gateway = PasswordLoginGatewayFactory.create(school)
-        gateway.login(school, requestUsername, requestPassword, object : PasswordLoginCallback {
-            private var hasNotifiedCancellation = false
+        coordinator.beginLogin(school, requestAccountKey, requestUsername, requestPassword,
+            object : CoordinatorCallback {
+                private fun postToUi(block: () -> Unit) {
+                    android.os.Handler(android.os.Looper.getMainLooper()).post(block)
+                }
 
-            private fun isRequestCurrent(): Boolean {
-                val currentSchool = userManager.currentSchool
-                return userManager.currentAccountStorageKey == requestAccountKey &&
-                    currentSchool?.id == requestSchoolId &&
-                    userManager.username == requestUsername
-            }
-
-            private fun postToUi(block: () -> Unit) {
-                android.os.Handler(android.os.Looper.getMainLooper()).post post@{
-                    if (!isRequestCurrent()) {
-                        isRefreshingCookie = false
-                        if (!hasNotifiedCancellation) {
-                            hasNotifiedCancellation = true
-                            Toast.makeText(context, "账号已切换，本次 Cookie 更新已取消", Toast.LENGTH_SHORT).show()
+                private fun isInstalledTargetCurrent(
+                    target: SessionInstallTarget,
+                    generation: Long
+                ): Boolean {
+                    val currentSchool = userManager.currentSchool ?: return false
+                    return SchoolSessionScope.fromSchool(currentSchool) == target.schoolScope &&
+                        userManager.currentAccountStorageKey == target.accountStorageKey &&
+                        SessionRegistry.snapshot(target.accountStorageKey).let {
+                            it.generation == generation && it.state == SessionState.ACTIVE
                         }
-                        return@post
+                }
+
+                private fun showCancelled() {
+                    isRefreshingCookie = false
+                    Toast.makeText(context, "账号已切换，本次更新已取消", Toast.LENGTH_SHORT).show()
+                }
+
+                override fun onInstalled(target: SessionInstallTarget, result: SessionInstallResult) {
+                    postToUi {
+                        when (result) {
+                            is SessionInstallResult.InstalledActive -> {
+                                if (!isInstalledTargetCurrent(target, result.snapshot.generation) ||
+                                    !userManager.completePasswordLogin(
+                                        target,
+                                        requestUsername,
+                                        requestPassword
+                                    )
+                                ) {
+                                    showCancelled()
+                                    return@postToUi
+                                }
+                                isRefreshingCookie = false
+                                refreshAccountUiState()
+                                Toast.makeText(context, "Cookie 已更新", Toast.LENGTH_SHORT).show()
+                            }
+                            is SessionInstallResult.InstalledInactive,
+                            SessionInstallResult.StaleTarget -> showCancelled()
+                            SessionInstallResult.InvalidScope -> {
+                                isRefreshingCookie = false
+                                Toast.makeText(context, "登录会话作用域无效，请重新登录", Toast.LENGTH_LONG).show()
+                            }
+                            SessionInstallResult.UnsupportedArtifact -> {
+                                isRefreshingCookie = false
+                                Toast.makeText(context, "当前登录结果尚不受支持", Toast.LENGTH_LONG).show()
+                            }
+                        }
                     }
-                    block()
                 }
-            }
 
-            override fun onSuccess(cookie: String) {
-                gateway.clearSensitiveState()
-                postToUi {
-                    userManager.savePasswordLogin(requestUsername, cookie, requestPassword)
-                    userManager.refreshRuntimeForCurrentAccount()
-                    isRefreshingCookie = false
-                    refreshAccountUiState()
-                    Toast.makeText(context, "Cookie 已更新", Toast.LENGTH_SHORT).show()
+                override fun onJoinInFlight(target: SessionInstallTarget) {
+                    postToUi {
+                        isRefreshingCookie = false
+                        Toast.makeText(context, "该账号正在登录，请稍候", Toast.LENGTH_SHORT).show()
+                    }
                 }
-            }
 
-            override fun onCaptchaRequired(imageBytes: ByteArray) {
-                gateway.clearSensitiveState()
-                postToUi {
-                    isRefreshingCookie = false
-                    Toast.makeText(context, "更新 Cookie 需要验证码，请重新使用密码登录", Toast.LENGTH_LONG).show()
+                override fun onCaptchaRequired(target: SessionInstallTarget, imageBytes: ByteArray) {
+                    coordinator.cancel(target.accountStorageKey)
+                    postToUi {
+                        isRefreshingCookie = false
+                        Toast.makeText(context, "更新 Cookie 需要验证码，请重新使用密码登录", Toast.LENGTH_LONG).show()
+                    }
                 }
-            }
 
-            override fun onCaptchaInvalid() {
-                gateway.clearSensitiveState()
-                postToUi {
-                    isRefreshingCookie = false
-                    Toast.makeText(context, "验证码校验失败，请重新使用密码登录", Toast.LENGTH_LONG).show()
+                override fun onCaptchaInvalid(target: SessionInstallTarget) {
+                    coordinator.cancel(target.accountStorageKey)
+                    postToUi {
+                        isRefreshingCookie = false
+                        Toast.makeText(context, "验证码校验失败，请重新使用密码登录", Toast.LENGTH_LONG).show()
+                    }
                 }
-            }
 
-            override fun onInvalidCredentials() {
-                gateway.clearSensitiveState()
-                postToUi {
-                    isRefreshingCookie = false
-                    Toast.makeText(context, "密码已失效，请重新登录", Toast.LENGTH_LONG).show()
+                override fun onInvalidCredentials(target: SessionInstallTarget) {
+                    postToUi {
+                        isRefreshingCookie = false
+                        Toast.makeText(context, "密码已失效，请重新登录", Toast.LENGTH_LONG).show()
+                    }
                 }
-            }
 
-            override fun onError(message: String) {
-                gateway.clearSensitiveState()
-                postToUi {
-                    isRefreshingCookie = false
-                    Toast.makeText(context, "更新失败：$message", Toast.LENGTH_LONG).show()
+                override fun onError(target: SessionInstallTarget?, message: String) {
+                    postToUi {
+                        isRefreshingCookie = false
+                        Toast.makeText(context, "更新失败：$message", Toast.LENGTH_LONG).show()
+                    }
                 }
             }
-        })
+        )
     }
     
     if (showSchoolAdaptation) {
@@ -637,7 +665,7 @@ fun SettingsRoute(
                             .fillMaxWidth()
                             .clickable {
                                 UserManager.getInstance().clearLoginState()
-                                UserManager.getInstance().currentSchool = school
+                                UserManager.getInstance().setCurrentSchool(school)
                                 Toast.makeText(context, "已切换到: ${school.name}", Toast.LENGTH_SHORT).show()
                                 performLogout()
                                 dismiss()

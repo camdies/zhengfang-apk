@@ -5,18 +5,27 @@ import android.util.Log
 import android.widget.Toast
 import androidx.compose.runtime.*
 import androidx.compose.ui.platform.LocalContext
-import com.tyust.course.login.PasswordLoginCallback
-import com.tyust.course.login.PasswordLoginGatewayFactory
 import com.tyust.course.manager.UserManager
 import com.tyust.course.model.SchoolConfig
-import com.tyust.course.network.CourseApiClient
+import com.tyust.course.session.AcademicRepository
+import com.tyust.course.session.AcademicResponse
+import com.tyust.course.session.AcademicResponseCallback
+import com.tyust.course.session.CoordinatorCallback
+import com.tyust.course.session.CurrentTermResolution
+import com.tyust.course.session.ScnuProtocolCapabilities
+import com.tyust.course.session.SchoolSessionScope
+import com.tyust.course.session.SessionInstallResult
+import com.tyust.course.session.SessionInstallTarget
+import com.tyust.course.session.SessionRequestContext
+import com.tyust.course.session.SessionRequestOwner
+import com.tyust.course.session.SessionRequestPurpose
+import com.tyust.course.session.SessionRegistry
+import com.tyust.course.session.SessionState
+import com.tyust.course.session.TermResolver
 import com.tyust.course.ui.screen.ExamItemUi
 import com.tyust.course.ui.screen.GradeItemUi
 import com.tyust.course.ui.screen.GradesScreen
 import com.tyust.course.ui.screen.OverallStatsUi
-import okhttp3.Call
-import okhttp3.Callback
-import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -28,7 +37,8 @@ import java.util.regex.Pattern
 @Composable
 fun GradesRoute() {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
+    val academicRepository = remember { AcademicRepository() }
+    val termResolver = remember { TermResolver() }
     
     // State
     var currentTab by remember { mutableIntStateOf(0) }
@@ -46,19 +56,31 @@ fun GradesRoute() {
     var examList by remember { mutableStateOf<List<ExamItemUi>>(emptyList()) }
     var examIsLoading by remember { mutableStateOf(false) }
 
-    // Init semesters
+    // Init semesters through the shared resolver.  Canonical SCNU does not
+    // guess a term endpoint or a local-calendar encoding when no verified
+    // profile/cache exists.
     LaunchedEffect(Unit) {
-        val calendar = Calendar.getInstance()
-        val year = calendar.get(Calendar.YEAR)
-        val month = calendar.get(Calendar.MONTH)
-        val startYear = if (month >= 7) year else year - 1
-        val list = mutableListOf<String>()
-        for (y in startYear downTo startYear - 3) {
-            list.add("$y-${y + 1}-1")
-            list.add("$y-${y + 1}-2")
+        val manager = UserManager.getInstance()
+        val school = manager.currentSchool ?: return@LaunchedEffect
+        when (val resolved = termResolver.resolveCurrentTerm(school, manager.currentAccountStorageKey)) {
+            is CurrentTermResolution.Available -> {
+                val calendar = Calendar.getInstance()
+                val startYear = resolved.term.academicYear.toIntOrNull()
+                    ?: calendar.get(Calendar.YEAR)
+                val list = mutableListOf<String>()
+                for (year in startYear downTo startYear - 3) {
+                    list += "$year-${year + 1}-1"
+                    list += "$year-${year + 1}-2"
+                }
+                semesters = list
+                currentSemester = resolved.term.label
+            }
+            CurrentTermResolution.ProtocolNotVerified -> {
+                semesters = emptyList()
+                currentSemester = ""
+                Toast.makeText(context, "SCNU 学期协议尚未验证", Toast.LENGTH_LONG).show()
+            }
         }
-        semesters = list
-        if (list.isNotEmpty()) currentSemester = list[0]
     }
 
     // Handlers
@@ -66,149 +88,302 @@ fun GradesRoute() {
         android.os.Handler(android.os.Looper.getMainLooper()).post(action)
     }
 
-    fun isCurrentAccount(accountKey: String): Boolean {
-        return UserManager.getInstance().currentAccountStorageKey == accountKey
-    }
+    fun requestContext(school: SchoolConfig, accountKey: String): SessionRequestContext =
+        SessionRequestContext.forSchool(
+            school = school,
+            accountStorageKey = accountKey,
+            purpose = SessionRequestPurpose.ACADEMIC_QUERY,
+            owner = SessionRequestOwner.UI,
+            activeContextEpoch = SessionRegistry.activeContextEpoch()
+        )
 
-    fun runOnUiThreadForAccount(accountKey: String, action: () -> Unit) {
+    fun isCurrentAccount(accountKey: String): Boolean =
+        UserManager.getInstance().currentAccountStorageKey == accountKey
+
+    fun runOnUiThreadForResponse(response: AcademicResponse, action: () -> Unit) {
         runOnUiThread {
-            if (isCurrentAccount(accountKey)) action()
+            if (response.isCurrent && isCurrentAccount(response.context.normalizedAccountStorageKey)) action()
         }
     }
 
-    // 检测到Cookie过期时，尝试自动重新登录
-    fun handleExpiredCookie(requestAccountKey: String, retryAction: () -> Unit) {
-        if (!isCurrentAccount(requestAccountKey)) return
-        val userManager = UserManager.getInstance()
-        val sendExpiredBroadcast = {
-            val intent = Intent(CourseApiClient.ACTION_COOKIE_EXPIRED).apply {
-                setPackage(context.packageName)
-                putExtra(CourseApiClient.EXTRA_ACCOUNT_STORAGE_KEY, requestAccountKey)
-            }
-            context.sendBroadcast(intent)
-        }
+    /**
+     * A confirmed-expired response has already advanced its account generation
+     * in CourseApiClient.  Do not use [SessionRequestContext.isSnapshotCurrent]
+     * here: it is intentionally false after that transition.  Instead, only
+     * the immediately succeeding EXPIRED snapshot for this exact UI identity
+     * is eligible to start/join an interactive refresh.
+     */
+    fun belongsToCurrentUiContext(contextSnapshot: SessionRequestContext): Boolean {
+        val manager = UserManager.getInstance()
+        val school = manager.currentSchool ?: return false
+        val epochMatches = contextSnapshot.activeContextEpoch == null ||
+            contextSnapshot.activeContextEpoch == SessionRegistry.activeContextEpoch()
+        return epochMatches &&
+            isCurrentAccount(contextSnapshot.normalizedAccountStorageKey) &&
+            SchoolSessionScope.fromSchool(school) == contextSnapshot.schoolScope
+    }
 
-        if (userManager.canAutoRelogin()) {
-            runOnUiThread {
-                Toast.makeText(context, "Cookie已过期，正在自动重新登录…", Toast.LENGTH_SHORT).show()
-            }
-            val school = userManager.currentSchool!!
-            val username = userManager.username
-            val password = userManager.sessionPassword
-            val gateway = PasswordLoginGatewayFactory.create(school)
-            gateway.login(school, username, password, object : PasswordLoginCallback {
-                override fun onSuccess(cookie: String) {
-                    gateway.clearSensitiveState()
-                    if (!isCurrentAccount(requestAccountKey)) return
-                    userManager.saveCookie(cookie)
-                    CourseApiClient.getInstance().setCookie(school.baseUrl, cookie)
-                    Log.d("GradesRoute", "自动重新登录成功，重试操作")
-                    retryAction()
-                }
-                override fun onCaptchaRequired(imageBytes: ByteArray) {
-                    gateway.clearSensitiveState()
-                    runOnUiThread {
-                        Toast.makeText(context, "自动登录需要验证码，请手动重新登录", Toast.LENGTH_LONG).show()
-                        sendExpiredBroadcast()
-                    }
-                }
-                override fun onCaptchaInvalid() {
-                    gateway.clearSensitiveState()
-                    runOnUiThread {
-                        Toast.makeText(context, "自动登录失败，请手动重新登录", Toast.LENGTH_LONG).show()
-                        sendExpiredBroadcast()
-                    }
-                }
-                override fun onInvalidCredentials() {
-                    gateway.clearSensitiveState()
-                    runOnUiThread {
-                        Toast.makeText(context, "密码已失效，请手动重新登录", Toast.LENGTH_LONG).show()
-                        sendExpiredBroadcast()
-                    }
-                }
-                override fun onError(message: String) {
-                    gateway.clearSensitiveState()
-                    runOnUiThread {
-                        Toast.makeText(context, "自动登录失败: $message", Toast.LENGTH_LONG).show()
-                        sendExpiredBroadcast()
-                    }
-                }
-            })
-        } else {
-            runOnUiThread {
-                Toast.makeText(context, "Cookie已过期，请重新登录", Toast.LENGTH_LONG).show()
-                sendExpiredBroadcast()
+    fun canRecoverConfirmedExpired(contextSnapshot: SessionRequestContext): Boolean {
+        if (!belongsToCurrentUiContext(contextSnapshot)) return false
+        val current = SessionRegistry.snapshot(contextSnapshot.normalizedAccountStorageKey)
+        return current.state == SessionState.EXPIRED &&
+            current.generation == contextSnapshot.sessionGeneration + 1L
+    }
+
+    fun stopIfStillRelevant(contextSnapshot: SessionRequestContext, stopLoading: () -> Unit) {
+        runOnUiThread {
+            if (belongsToCurrentUiContext(contextSnapshot)) {
+                stopLoading()
             }
         }
     }
 
-    fun isLoginPageHtml(html: String): Boolean {
-        return html.contains("用户登录") || html.contains("登 录") ||
-               html.contains("slogin.html") || html.contains("id=\"pwd\"") ||
-               html.contains("name=\"yhm\"") || html.contains("notLogin")
+    fun abandonRecovery(
+        contextSnapshot: SessionRequestContext,
+        stopLoading: () -> Unit,
+        message: String
+    ) {
+        runOnUiThread {
+            if (belongsToCurrentUiContext(contextSnapshot)) {
+                stopLoading()
+                Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    fun isInstalledRefreshTargetCurrent(
+        target: SessionInstallTarget,
+        installedGeneration: Long,
+        originalContext: SessionRequestContext
+    ): Boolean {
+        val manager = UserManager.getInstance()
+        val school = manager.currentSchool ?: return false
+        val epochMatches = originalContext.activeContextEpoch == null ||
+            originalContext.activeContextEpoch == SessionRegistry.activeContextEpoch()
+        val snapshot = SessionRegistry.snapshot(target.accountStorageKey)
+        return epochMatches &&
+            SchoolSessionScope.fromSchool(school) == target.schoolScope &&
+            SessionRegistry.normalizeAccountKey(manager.currentAccountStorageKey) == target.accountStorageKey &&
+            snapshot.state == SessionState.ACTIVE &&
+            snapshot.generation == installedGeneration
+    }
+
+    /**
+     * Read-only academic queries may wait for the shared account refresh and
+     * retry their original operation once.  It deliberately does not change
+     * GrabService behavior, does not persist credentials, and leaves the
+     * canonical SCNU login capability closed until protocol evidence exists.
+     */
+    fun recoverConfirmedExpired(
+        response: AcademicResponse,
+        alreadyRetried: Boolean,
+        stopLoading: () -> Unit,
+        retryOriginalOperation: () -> Unit
+    ) {
+        val originalContext = response.context
+        if (!canRecoverConfirmedExpired(originalContext)) {
+            stopIfStillRelevant(originalContext, stopLoading)
+            return
+        }
+        if (alreadyRetried) {
+            abandonRecovery(originalContext, stopLoading, "登录已过期，请重新登录后再试")
+            return
+        }
+
+        val manager = UserManager.getInstance()
+        val school = manager.currentSchool ?: run {
+            stopIfStillRelevant(originalContext, stopLoading)
+            return
+        }
+        if (ScnuProtocolCapabilities.isCanonicalScnu(school) &&
+            !ScnuProtocolCapabilities.LOGIN_ENABLED
+        ) {
+            abandonRecovery(originalContext, stopLoading, ScnuProtocolCapabilities.unavailableMessage())
+            return
+        }
+        if (!manager.canAutoRelogin()) {
+            abandonRecovery(originalContext, stopLoading, "登录已过期，请重新使用密码登录")
+            return
+        }
+
+        val accountStorageKey = manager.currentAccountStorageKey
+        val username = manager.username
+        val password = manager.sessionPassword
+        if (username.isBlank() || password.isEmpty()) {
+            abandonRecovery(originalContext, stopLoading, "当前会话未保留内存密码，请重新登录")
+            return
+        }
+
+        manager.sessionRefreshCoordinator.beginLoginAndAwait(
+            school,
+            accountStorageKey,
+            username,
+            password,
+            object : CoordinatorCallback {
+                override fun onInstalled(target: SessionInstallTarget, result: SessionInstallResult) {
+                    runOnUiThread {
+                        val installed = result as? SessionInstallResult.InstalledActive
+                        if (installed == null ||
+                            !isInstalledRefreshTargetCurrent(
+                                target,
+                                installed.snapshot.generation,
+                                originalContext
+                            )
+                        ) {
+                            stopIfStillRelevant(originalContext, stopLoading)
+                            return@runOnUiThread
+                        }
+
+                        // The retry is deliberately preceded by a fresh term
+                        // resolution.  For a manually selected historical
+                        // semester we keep that user choice, while exam and
+                        // default-term paths read the freshly resolved value
+                        // again inside their original operation.
+                        when (termResolver.resolveCurrentTerm(school, accountStorageKey)) {
+                            is CurrentTermResolution.Available -> retryOriginalOperation()
+                            CurrentTermResolution.ProtocolNotVerified -> abandonRecovery(
+                                originalContext,
+                                stopLoading,
+                                "SCNU 学期协议尚未验证"
+                            )
+                        }
+                    }
+                }
+
+                override fun onJoinInFlight(target: SessionInstallTarget) {
+                    runOnUiThread {
+                        if (belongsToCurrentUiContext(originalContext)) {
+                            Toast.makeText(context, "正在等待该账号的会话刷新", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+
+                override fun onCaptchaRequired(target: SessionInstallTarget, imageBytes: ByteArray) {
+                    abandonRecovery(originalContext, stopLoading, "会话刷新需要验证码，请重新登录")
+                }
+
+                override fun onCaptchaInvalid(target: SessionInstallTarget) {
+                    abandonRecovery(originalContext, stopLoading, "会话刷新验证码无效，请重新登录")
+                }
+
+                override fun onInvalidCredentials(target: SessionInstallTarget) {
+                    abandonRecovery(originalContext, stopLoading, "密码已失效，请重新登录")
+                }
+
+                override fun onError(target: SessionInstallTarget?, message: String) {
+                    abandonRecovery(
+                        originalContext,
+                        stopLoading,
+                        message.ifBlank { "会话刷新失败，请重新登录" }
+                    )
+                }
+            }
+        )
     }
 
     // Logic for Semester Grades
-    var loadSemesterGrades by remember { mutableStateOf<(() -> Unit)?>(null) }
-    loadSemesterGrades = {
+    var loadSemesterGrades by remember { mutableStateOf<((Boolean) -> Unit)?>(null) }
+    loadSemesterGrades = { alreadyRetried ->
         val userManager = UserManager.getInstance()
         val school = userManager.currentSchool
         val requestAccountKey = userManager.currentAccountStorageKey
         val requestSemester = currentSemester
         if (school != null && requestSemester.isNotEmpty()) {
-
             semesterIsLoading = true
-            CourseApiClient.getInstance().fetchGrades(school, requestSemester, object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    runOnUiThreadForAccount(requestAccountKey) {
-                        semesterIsLoading = false
-                        Toast.makeText(context, "加载失败: ${e.message}", Toast.LENGTH_SHORT).show()
+            val contextSnapshot = requestContext(school, requestAccountKey)
+            academicRepository.fetchGrades(school, requestSemester, contextSnapshot, object : AcademicResponseCallback {
+                override fun onFailure(contextSnapshot: SessionRequestContext, error: IOException) {
+                    runOnUiThread {
+                        if (contextSnapshot.isSnapshotCurrent() &&
+                            isCurrentAccount(contextSnapshot.normalizedAccountStorageKey)
+                        ) {
+                            semesterIsLoading = false
+                            Toast.makeText(context, "加载失败: ${error.message}", Toast.LENGTH_SHORT).show()
+                        }
                     }
                 }
 
-                override fun onResponse(call: Call, response: Response) {
-                    val json = response.body?.string() ?: ""
+                override fun onProtocolNotVerified(contextSnapshot: SessionRequestContext) {
+                    runOnUiThread {
+                        if (isCurrentAccount(contextSnapshot.normalizedAccountStorageKey)) {
+                            semesterIsLoading = false
+                            Toast.makeText(context, "SCNU 成绩协议尚未验证", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }
 
-                    // 检测Cookie过期
-                    if (isLoginPageHtml(json)) {
-                        runOnUiThreadForAccount(requestAccountKey) { semesterIsLoading = false }
-                        handleExpiredCookie(requestAccountKey) { loadSemesterGrades?.invoke() }
+                override fun onResponse(response: AcademicResponse) {
+                    if (response.isConfirmedExpired) {
+                        recoverConfirmedExpired(
+                            response = response,
+                            alreadyRetried = alreadyRetried,
+                            stopLoading = { semesterIsLoading = false },
+                            retryOriginalOperation = {
+                                semesterIsLoading = false
+                                loadSemesterGrades?.invoke(true)
+                            }
+                        )
                         return
                     }
+                    if (!response.isCurrent) return
+                    val json = response.body
 
-                    // 先从接口B解析基础成绩（清除接口B返回的不完整分项数据）
+                    // 先从接口 B 解析基础成绩（清除接口 B 返回的不完整分项数据）。
                     val items = GradesLogic.parseGradesJson(json).map { it.copy(detail = "") }
-
                     if (items.isEmpty()) {
-                        runOnUiThreadForAccount(requestAccountKey) {
+                        runOnUiThreadForResponse(response) {
                             semesterIsLoading = false
                             semesterGrades = emptyList()
                         }
-                    } else {
-                        // 始终请求接口A获取完整分项详情
-                        // 接口B可能只返回部分分项（如仅"平时"），不能作为完整分项数据使用
-                        CourseApiClient.getInstance().fetchGradeDetails(school, requestSemester, object : Callback {
-                            override fun onFailure(call: Call, e: IOException) {
-                                Log.w("GradesRoute", "Detail fetch failed: ${e.message}")
-                                // 接口A失败时，尝试用接口B原始数据中的分项作为兜底
+                        return
+                    }
+
+                    // The detail request deliberately carries the exact same
+                    // UI snapshot/generation as the summary request.
+                    academicRepository.fetchGradeDetails(school, requestSemester, response.context,
+                        object : AcademicResponseCallback {
+                            override fun onFailure(contextSnapshot: SessionRequestContext, error: IOException) {
                                 val fallbackItems = GradesLogic.parseGradesJson(json)
-                                runOnUiThreadForAccount(requestAccountKey) {
-                                    semesterIsLoading = false
-                                    semesterGrades = fallbackItems
+                                runOnUiThread {
+                                    if (contextSnapshot.isSnapshotCurrent() &&
+                                        isCurrentAccount(contextSnapshot.normalizedAccountStorageKey)
+                                    ) {
+                                        semesterIsLoading = false
+                                        semesterGrades = fallbackItems
+                                    }
                                 }
                             }
 
-                            override fun onResponse(call: Call, response: Response) {
-                                val detailJson = response.body?.string() ?: ""
-                                Log.d("GradesRoute", "Detail response length: ${detailJson.length}")
-                                val merged = GradesLogic.mergeDetails(items, detailJson)
-                                runOnUiThreadForAccount(requestAccountKey) {
+                            override fun onProtocolNotVerified(contextSnapshot: SessionRequestContext) {
+                                runOnUiThread {
+                                    if (isCurrentAccount(contextSnapshot.normalizedAccountStorageKey)) {
+                                        semesterIsLoading = false
+                                        Toast.makeText(context, "SCNU 成绩协议尚未验证", Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                            }
+
+                            override fun onResponse(detailResponse: AcademicResponse) {
+                                if (detailResponse.isConfirmedExpired) {
+                                    recoverConfirmedExpired(
+                                        response = detailResponse,
+                                        alreadyRetried = alreadyRetried,
+                                        stopLoading = { semesterIsLoading = false },
+                                        retryOriginalOperation = {
+                                            semesterIsLoading = false
+                                            loadSemesterGrades?.invoke(true)
+                                        }
+                                    )
+                                    return
+                                }
+                                if (!detailResponse.isCurrent) return
+                                val merged = GradesLogic.mergeDetails(items, detailResponse.body)
+                                runOnUiThreadForResponse(detailResponse) {
                                     semesterIsLoading = false
                                     semesterGrades = merged
                                 }
                             }
                         })
-                    }
                 }
             })
         }
@@ -216,65 +391,105 @@ fun GradesRoute() {
     
     // Trigger load on semester change
     LaunchedEffect(currentSemester) {
-        if (currentSemester.isNotEmpty()) loadSemesterGrades?.invoke()
+        if (currentSemester.isNotEmpty()) loadSemesterGrades?.invoke(false)
     }
 
     // Logic for Overall Grades
-    var loadOverallGrades by remember { mutableStateOf<(() -> Unit)?>(null) }
-    loadOverallGrades = {
+    var loadOverallGrades by remember { mutableStateOf<((Boolean) -> Unit)?>(null) }
+    loadOverallGrades = { alreadyRetried ->
         val userManager = UserManager.getInstance()
         val school = userManager.currentSchool
         val requestAccountKey = userManager.currentAccountStorageKey
-        if (school != null && !overallIsLoading) {
-
+        if (school != null && (!overallIsLoading || alreadyRetried)) {
             overallIsLoading = true
             overallGrades = emptyList() // Clear
-
-            CourseApiClient.getInstance().fetchOverallGradesIndex(school, object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    runOnUiThreadForAccount(requestAccountKey) {
-                        overallIsLoading = false
-                        Toast.makeText(context, "获取参数失败: ${e.message}", Toast.LENGTH_SHORT).show()
+            val contextSnapshot = requestContext(school, requestAccountKey)
+            academicRepository.fetchOverallGradesIndex(school, contextSnapshot, object : AcademicResponseCallback {
+                override fun onFailure(contextSnapshot: SessionRequestContext, error: IOException) {
+                    runOnUiThread {
+                        if (contextSnapshot.isSnapshotCurrent() &&
+                            isCurrentAccount(contextSnapshot.normalizedAccountStorageKey)
+                        ) {
+                            overallIsLoading = false
+                            Toast.makeText(context, "获取参数失败: ${error.message}", Toast.LENGTH_SHORT).show()
+                        }
                     }
                 }
 
-                override fun onResponse(call: Call, response: Response) {
-                    val html = response.body?.string() ?: ""
-                    
-                    // Parse Index Logic
-                    if (isLoginPageHtml(html)) {
-                        runOnUiThreadForAccount(requestAccountKey) { overallIsLoading = false }
-                        handleExpiredCookie(requestAccountKey) { loadOverallGrades?.invoke() }
+                override fun onProtocolNotVerified(contextSnapshot: SessionRequestContext) {
+                    runOnUiThread {
+                        if (isCurrentAccount(contextSnapshot.normalizedAccountStorageKey)) {
+                            overallIsLoading = false
+                            Toast.makeText(context, "SCNU 成绩协议尚未验证", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }
+
+                override fun onResponse(indexResponse: AcademicResponse) {
+                    if (indexResponse.isConfirmedExpired) {
+                        recoverConfirmedExpired(
+                            response = indexResponse,
+                            alreadyRetried = alreadyRetried,
+                            stopLoading = { overallIsLoading = false },
+                            retryOriginalOperation = {
+                                overallIsLoading = false
+                                loadOverallGrades?.invoke(true)
+                            }
+                        )
                         return
                     }
-
+                    if (!indexResponse.isCurrent) return
+                    val html = indexResponse.body
                     val doc = Jsoup.parse(html)
                     val (gpa, credits, count) = GradesLogic.extractSummaryInfo(doc, html)
-                    
-                    // Update initial stats from summary
-                    runOnUiThreadForAccount(requestAccountKey) {
+                    runOnUiThreadForResponse(indexResponse) {
                         overallStats = OverallStatsUi(gpa, credits.toString(), count, 0, 0, 0, 0)
                     }
 
                     val xfyqjdIds = GradesLogic.extractXfyqjdIds(doc, html)
-                    val xh_id = doc.selectFirst("input[name=xh_id]")?.attr("value") ?: ""
+                    val xhId = doc.selectFirst("input[name=xh_id]")?.attr("value") ?: ""
                     val cjlrxn = doc.selectFirst("input[name=cjlrxn]")?.attr("value") ?: ""
                     val cjlrxq = doc.selectFirst("input[name=cjlrxq]")?.attr("value") ?: ""
-
                     if (xfyqjdIds.isEmpty()) {
-                        runOnUiThreadForAccount(requestAccountKey) { overallIsLoading = false }
+                        runOnUiThreadForResponse(indexResponse) { overallIsLoading = false }
                         return
                     }
-                    
-                    // Recursive Fetch
+
                     GradesLogic.fetchGradesDetailsRecursive(
-                        school, xfyqjdIds.toList(), 0, xh_id, cjlrxn, cjlrxq, mutableListOf(),
+                        repository = academicRepository,
+                        school = school,
+                        context = indexResponse.context,
+                        ids = xfyqjdIds.toList(),
+                        index = 0,
+                        xhId = xhId,
+                        cjlrxn = cjlrxn,
+                        cjlrxq = cjlrxq,
+                        accumulatedGrades = mutableListOf(),
                         onComplete = { resultGrades ->
-                             runOnUiThreadForAccount(requestAccountKey) {
-                                 overallIsLoading = false
-                                 overallGrades = resultGrades
-                                 overallStats = GradesLogic.calculateStats(resultGrades, gpa, credits, count)
-                             }
+                            runOnUiThreadForResponse(indexResponse) {
+                                overallIsLoading = false
+                                overallGrades = resultGrades
+                                overallStats = GradesLogic.calculateStats(resultGrades, gpa, credits, count)
+                            }
+                        },
+                        onConfirmedExpired = { expired ->
+                            recoverConfirmedExpired(
+                                response = expired,
+                                alreadyRetried = alreadyRetried,
+                                stopLoading = { overallIsLoading = false },
+                                retryOriginalOperation = {
+                                    overallIsLoading = false
+                                    loadOverallGrades?.invoke(true)
+                                }
+                            )
+                        },
+                        onProtocolNotVerified = {
+                            runOnUiThread {
+                                if (isCurrentAccount(indexResponse.context.normalizedAccountStorageKey)) {
+                                    overallIsLoading = false
+                                    Toast.makeText(context, "SCNU 成绩协议尚未验证", Toast.LENGTH_LONG).show()
+                                }
+                            }
                         }
                     )
                 }
@@ -283,48 +498,68 @@ fun GradesRoute() {
     }
 
     // Logic for Exam Schedule
-    var loadExamSchedule by remember { mutableStateOf<(() -> Unit)?>(null) }
-    loadExamSchedule = {
+    var loadExamSchedule by remember { mutableStateOf<((Boolean) -> Unit)?>(null) }
+    loadExamSchedule = { alreadyRetried ->
         val userManager = UserManager.getInstance()
         val school = userManager.currentSchool
         val requestAccountKey = userManager.currentAccountStorageKey
-        if (school != null && !examIsLoading) {
-
+        if (school != null && (!examIsLoading || alreadyRetried)) {
             examIsLoading = true
             examList = emptyList()
-
-            // 计算当前学年学期参数 (与课表一致的逻辑)
-            val calendar = Calendar.getInstance()
-            val year = calendar.get(Calendar.YEAR)
-            val month = calendar.get(Calendar.MONTH)
-            val xnm = if (month >= 7) year.toString() else (year - 1).toString()
-            val xqm = if (month >= 7 || month < 2) "3" else "12" // 3=第一学期, 12=第二学期
-
-            CourseApiClient.getInstance().fetchExamSchedule(school, xnm, xqm, object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    runOnUiThreadForAccount(requestAccountKey) {
-                        examIsLoading = false
-                        Toast.makeText(context, "获取考试安排失败: ${e.message}", Toast.LENGTH_SHORT).show()
-                    }
+            when (val term = termResolver.resolveCurrentTerm(school, requestAccountKey)) {
+                CurrentTermResolution.ProtocolNotVerified -> {
+                    examIsLoading = false
+                    Toast.makeText(context, "SCNU 学期协议尚未验证", Toast.LENGTH_LONG).show()
                 }
+                is CurrentTermResolution.Available -> {
+                    val contextSnapshot = requestContext(school, requestAccountKey)
+                    academicRepository.fetchExamSchedule(
+                        school, term.term.academicYear, term.term.termCode, contextSnapshot,
+                        object : AcademicResponseCallback {
+                            override fun onFailure(contextSnapshot: SessionRequestContext, error: IOException) {
+                                runOnUiThread {
+                                    if (contextSnapshot.isSnapshotCurrent() &&
+                                        isCurrentAccount(contextSnapshot.normalizedAccountStorageKey)
+                                    ) {
+                                        examIsLoading = false
+                                        Toast.makeText(context, "获取考试安排失败: ${error.message}", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            }
 
-                override fun onResponse(call: Call, response: Response) {
-                    val json = response.body?.string() ?: ""
+                            override fun onProtocolNotVerified(contextSnapshot: SessionRequestContext) {
+                                runOnUiThread {
+                                    if (isCurrentAccount(contextSnapshot.normalizedAccountStorageKey)) {
+                                        examIsLoading = false
+                                        Toast.makeText(context, "SCNU 成绩协议尚未验证", Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                            }
 
-                    // 检测Cookie过期
-                    if (isLoginPageHtml(json)) {
-                        runOnUiThreadForAccount(requestAccountKey) { examIsLoading = false }
-                        handleExpiredCookie(requestAccountKey) { loadExamSchedule?.invoke() }
-                        return
-                    }
-
-                    val items = GradesLogic.parseExamJson(json)
-                    runOnUiThreadForAccount(requestAccountKey) {
-                        examIsLoading = false
-                        examList = items
-                    }
+                            override fun onResponse(response: AcademicResponse) {
+                                if (response.isConfirmedExpired) {
+                                    recoverConfirmedExpired(
+                                        response = response,
+                                        alreadyRetried = alreadyRetried,
+                                        stopLoading = { examIsLoading = false },
+                                        retryOriginalOperation = {
+                                            examIsLoading = false
+                                            loadExamSchedule?.invoke(true)
+                                        }
+                                    )
+                                    return
+                                }
+                                if (!response.isCurrent) return
+                                val items = GradesLogic.parseExamJson(response.body)
+                                runOnUiThreadForResponse(response) {
+                                    examIsLoading = false
+                                    examList = items
+                                }
+                            }
+                        }
+                    )
                 }
-            })
+            }
         }
     }
 
@@ -332,9 +567,9 @@ fun GradesRoute() {
         currentTab = currentTab,
         onTabChange = { 
             currentTab = it
-            if (it == 0 && semesterGrades.isEmpty() && currentSemester.isNotEmpty()) loadSemesterGrades?.invoke()
-            if (it == 1 && overallGrades.isEmpty()) loadOverallGrades?.invoke()
-            if (it == 2 && examList.isEmpty()) loadExamSchedule?.invoke()
+            if (it == 0 && semesterGrades.isEmpty() && currentSemester.isNotEmpty()) loadSemesterGrades?.invoke(false)
+            if (it == 1 && overallGrades.isEmpty()) loadOverallGrades?.invoke(false)
+            if (it == 2 && examList.isEmpty()) loadExamSchedule?.invoke(false)
         },
         semesterGrades = semesterGrades,
         semesters = semesters,
@@ -348,9 +583,9 @@ fun GradesRoute() {
         examIsLoading = examIsLoading,
         onRefresh = {
             when (currentTab) {
-                0 -> loadSemesterGrades?.invoke()
-                1 -> loadOverallGrades?.invoke()
-                2 -> loadExamSchedule?.invoke()
+                0 -> loadSemesterGrades?.invoke(false)
+                1 -> loadOverallGrades?.invoke(false)
+                2 -> loadExamSchedule?.invoke(false)
             }
         },
         onExportGrades = { grades ->
@@ -658,10 +893,14 @@ private object GradesLogic {
     }
     
     fun fetchGradesDetailsRecursive(
-        school: SchoolConfig, 
-        ids: List<String>, index: Int, xh_id: String, cjlrxn: String, cjlrxq: String,
+        repository: AcademicRepository,
+        school: SchoolConfig,
+        context: SessionRequestContext,
+        ids: List<String>, index: Int, xhId: String, cjlrxn: String, cjlrxq: String,
         accumulatedGrades: MutableList<GradeItemUi>,
-        onComplete: (List<GradeItemUi>) -> Unit
+        onComplete: (List<GradeItemUi>) -> Unit,
+        onConfirmedExpired: (AcademicResponse) -> Unit,
+        onProtocolNotVerified: () -> Unit
     ) {
         if (index >= ids.size) {
             onComplete(accumulatedGrades)
@@ -669,22 +908,37 @@ private object GradesLogic {
         }
 
         val xfyqjd_id = ids[index]
-        val postBody = "xfyqjd_id=$xfyqjd_id&xh_id=$xh_id&cjlrxn=$cjlrxn&cjlrxq=$cjlrxq&xscjcxkz=0&cjcxkzzt=2&cjztkz=0&cjzt="
+        val postBody = "xfyqjd_id=$xfyqjd_id&xh_id=$xhId&cjlrxn=$cjlrxn&cjlrxq=$cjlrxq&xscjcxkz=0&cjcxkzzt=2&cjztkz=0&cjzt="
 
-        CourseApiClient.getInstance().fetchOverallGradesData(school, postBody, object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                fetchGradesDetailsRecursive(school, ids, index + 1, xh_id, cjlrxn, cjlrxq, accumulatedGrades, onComplete)
+        repository.fetchOverallGradesData(school, postBody, context, object : AcademicResponseCallback {
+            override fun onFailure(contextSnapshot: SessionRequestContext, error: IOException) {
+                if (!contextSnapshot.isSnapshotCurrent()) return
+                fetchGradesDetailsRecursive(
+                    repository, school, contextSnapshot, ids, index + 1, xhId, cjlrxn, cjlrxq,
+                    accumulatedGrades, onComplete, onConfirmedExpired, onProtocolNotVerified
+                )
             }
 
-            override fun onResponse(call: Call, response: Response) {
-                val json = response.body?.string() ?: ""
-                val items = parseGradesJson(json)
+            override fun onProtocolNotVerified(contextSnapshot: SessionRequestContext) {
+                onProtocolNotVerified()
+            }
+
+            override fun onResponse(response: AcademicResponse) {
+                if (response.isConfirmedExpired) {
+                    onConfirmedExpired(response)
+                    return
+                }
+                if (!response.isCurrent) return
+                val items = parseGradesJson(response.body)
                 items.forEach { newItem ->
                     if (accumulatedGrades.none { it.courseName == newItem.courseName }) {
                         accumulatedGrades.add(newItem)
                     }
                 }
-                fetchGradesDetailsRecursive(school, ids, index + 1, xh_id, cjlrxn, cjlrxq, accumulatedGrades, onComplete)
+                fetchGradesDetailsRecursive(
+                    repository, school, response.context, ids, index + 1, xhId, cjlrxn, cjlrxq,
+                    accumulatedGrades, onComplete, onConfirmedExpired, onProtocolNotVerified
+                )
             }
         })
     }

@@ -6,6 +6,7 @@ import android.content.Intent
 import android.os.Build
 import android.util.Log
 import com.tyust.course.manager.UserManager
+import com.tyust.course.session.CourseSelectionCapability
 import com.tyust.course.service.GrabService
 
 /**
@@ -53,6 +54,14 @@ class GrabAlarmReceiver : BroadcastReceiver() {
         if (school == null) {
             Log.e(TAG, "❌ 未登录，无法执行定时任务")
             appendLog(context, accountStorageKey, "未登录，无法执行定时任务")
+            return
+        }
+        val unsupportedMessage = CourseSelectionCapability.unavailableMessage(school)
+        if (unsupportedMessage != null) {
+            // The alarm can fire long after it was created.  Keep the second
+            // gate here so no scheduled SCNU task reaches a network call.
+            Log.w(TAG, unsupportedMessage)
+            appendLog(context, accountStorageKey, "⚠️ $unsupportedMessage")
             return
         }
         

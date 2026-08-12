@@ -21,11 +21,23 @@ import com.tyust.course.manager.UserManager
 import com.tyust.course.model.Course
 import com.tyust.course.model.SchoolConfig
 import com.tyust.course.network.CourseApiClient
+import com.tyust.course.session.CourseSelectionCapability
+import com.tyust.course.session.SessionProbe
+import com.tyust.course.session.SessionProbeResult
+import com.tyust.course.session.SessionRequestContext
+import com.tyust.course.session.SessionRequestOwner
+import com.tyust.course.session.SessionRequestPurpose
+import com.tyust.course.session.SessionRegistry
+import com.tyust.course.session.SessionResponseClassification
+import com.tyust.course.session.SessionResponseClassifiers
+import com.tyust.course.session.SessionResponseState
+import com.tyust.course.session.SessionState
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Response
 import org.json.JSONArray
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicLong
 
 class GrabService : Service() {
     
@@ -62,6 +74,9 @@ class GrabService : Service() {
         const val EXTRA_QUEUE_UPDATED = "queue_updated"  // 队列已更新标志
         const val EXTRA_COURSE_STATUS = "course_status"  // success/failed/grabbing
         const val EXTRA_COURSE_NAME_STATUS = "course_name_status"  // 课程名
+
+        private const val NO_SERVICE_RUN = 0L
+        private val nextServiceRunId = AtomicLong(NO_SERVICE_RUN)
     }
     
     private var isRunning = false
@@ -69,6 +84,9 @@ class GrabService : Service() {
     private var currentSchool: SchoolConfig? = null
     private var serviceAccountKey = ""
     private var serviceAccountStorageKey = ""
+    // A stopped run invalidates all of its asynchronous probe callbacks.
+    @Volatile
+    private var serviceRunId = NO_SERVICE_RUN
     private var courseParams: Map<String, String>? = null
     
     private var interval = 1500
@@ -96,6 +114,20 @@ class GrabService : Service() {
         var retryCount: Int = 0,
         var skipCount: Int = 0,
         var cancelled: Boolean = false
+    )
+
+    /**
+     * Parsed fuzzy-match data is intentionally detached from the response
+     * callback.  Applying it to service state happens only after the frozen
+     * request context is revalidated on the main handler.
+     */
+    private data class FuzzyClassSnapshot(
+        val classId: String,
+        val doJxbId: String,
+        val currentSelected: Int,
+        val capacity: Int,
+        val teacher: String,
+        val time: String
     )
 
     private val pendingGrabTasks = java.util.ArrayDeque<GrabTaskContext>()
@@ -144,11 +176,31 @@ class GrabService : Service() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == com.tyust.course.network.CourseApiClient.ACTION_COOKIE_EXPIRED) {
                 val eventAccountStorageKey = intent.getStringExtra(CourseApiClient.EXTRA_ACCOUNT_STORAGE_KEY).orEmpty()
+                if (!intent.hasExtra(CourseApiClient.EXTRA_SESSION_GENERATION)) {
+                    Log.w(TAG, "Ignoring legacy cookie-expiry broadcast without session generation")
+                    return
+                }
+                val eventGeneration = intent.getLongExtra(
+                    CourseApiClient.EXTRA_SESSION_GENERATION,
+                    Long.MIN_VALUE
+                )
+                val eventSchoolId = intent.getStringExtra(CourseApiClient.EXTRA_SCHOOL_ID).orEmpty()
                 if (eventAccountStorageKey.isNotEmpty()
                     && serviceAccountStorageKey.isNotEmpty()
                     && eventAccountStorageKey != serviceAccountStorageKey
                 ) {
                     Log.d(TAG, "忽略其他账号的 Cookie 失效广播: $eventAccountStorageKey")
+                    return
+                }
+                if (eventSchoolId.isNotEmpty() && eventSchoolId != currentSchool?.id.orEmpty()) {
+                    Log.d(TAG, "Ignoring cookie-expiry broadcast for another school")
+                    return
+                }
+                val currentSnapshot = SessionRegistry.snapshot(serviceAccountStorageKey)
+                if (currentSnapshot.generation != eventGeneration ||
+                    currentSnapshot.state != SessionState.EXPIRED
+                ) {
+                    Log.d(TAG, "Ignoring stale cookie-expiry broadcast")
                     return
                 }
                 if (isRunning) {
@@ -354,6 +406,91 @@ class GrabService : Service() {
             || serviceAccountStorageKey.isBlank()
             || requestAccountStorageKey == serviceAccountStorageKey
     }
+
+    private fun ensureServiceRun(): Long {
+        // A START intent represents a fresh logical task, even when Android
+        // reuses this Service instance. Invalidate the prior run before the
+        // new action can create requests, so late callbacks cannot attach to
+        // the replacement task.
+        if (serviceRunId != NO_SERVICE_RUN) {
+            stopGrabbing()
+        }
+        serviceRunId = nextServiceRunId.incrementAndGet()
+        return serviceRunId
+    }
+
+    /** Captures the exact service generation for an outbound selection request. */
+    private fun serviceRequestContext(
+        school: SchoolConfig,
+        capturedRunId: Long = serviceRunId
+    ): SessionRequestContext = SessionRequestContext.forSchool(
+        school = school,
+        accountStorageKey = serviceAccountStorageKey,
+        purpose = SessionRequestPurpose.GRAB_SERVICE,
+        owner = SessionRequestOwner.SERVICE,
+        activeContextEpoch = null,
+        serviceRunId = capturedRunId
+    )
+
+    /**
+     * Drops callbacks from a stopped/replaced service generation before they
+     * can schedule another request or mutate the current task state.
+     */
+    private fun guardedServiceCallback(
+        requestContext: SessionRequestContext,
+        delegate: Callback
+    ): Callback = object : Callback {
+        override fun onFailure(call: Call, e: IOException) {
+            if (!isCurrentServiceRequest(requestContext)) {
+                Log.d(TAG, "Discarding stale service request failure")
+                return
+            }
+            delegate.onFailure(call, e)
+        }
+
+        override fun onResponse(call: Call, response: Response) {
+            if (!isCurrentServiceRequest(requestContext)) {
+                response.close()
+                Log.d(TAG, "Discarding stale service request response")
+                return
+            }
+            delegate.onResponse(call, response)
+        }
+    }
+
+    private fun postForCurrentServiceRequest(
+        requestContext: SessionRequestContext,
+        delayMs: Long = 0L,
+        block: () -> Unit
+    ) {
+        val runnable = Runnable {
+            if (isCurrentServiceRequest(requestContext)) {
+                block()
+            } else {
+                Log.d(TAG, "Discarding stale deferred service request work")
+            }
+        }
+        if (delayMs > 0L) {
+            handler.postDelayed(runnable, delayMs)
+        } else {
+            handler.post(runnable)
+        }
+    }
+
+    private fun rejectUnsupportedCourseSelection() {
+        val message = CourseSelectionCapability.unavailableMessage(currentSchool)
+            ?: "当前学校的选课协议尚未验证，已阻止启动。"
+        Log.w(TAG, message)
+
+        // This is a capability decision, not a session-expiry event.  Do not
+        // emit ACTION_COOKIE_EXPIRED or mutate the account login state.
+        if (isRunning || serviceRunId != NO_SERVICE_RUN) {
+            stopGrabbing()
+        }
+        broadcastLogForAccount(serviceAccountStorageKey, "⚠️ $message")
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
@@ -379,6 +516,11 @@ class GrabService : Service() {
                 }
                 return START_STICKY
             }
+            if (!CourseSelectionCapability.isSupported(currentSchool)) {
+                rejectUnsupportedCourseSelection()
+                return START_STICKY
+            }
+            ensureServiceRun()
         }
 
         when (intent?.action) {
@@ -394,7 +536,7 @@ class GrabService : Service() {
                 serviceQueue = SmartSelector.getInstance().queue.map { it.copy() }.toMutableList()
                 currentSchool = UserManager.getInstance().currentSchool
                 courseParams = SmartSelector.getInstance().courseParams?.toMap()
-                
+
                 if (targetCourse != null && currentSchool != null) {
                     startForeground(NOTIFICATION_ID, createNotification("正在抢课: $courseName"))
                     startGrabbing()
@@ -426,8 +568,8 @@ class GrabService : Service() {
                 }
                 
                 // 🚀 获取列表前先检查 Cookie
-                checkCookieValidity(currentSchool!!) { isValid ->
-                    if (!isValid) return@checkCookieValidity
+                checkCookieValidity(currentSchool!!) { probeResult ->
+                    if (!canContinueAfterSessionProbe(probeResult)) return@checkCookieValidity
                     
                     val modeText = if (isParallelMode) "并行模式(${parallelWorkerCount}门)" else "顺序模式"
                     startForeground(NOTIFICATION_ID, createNotification("正在获取课程列表..."))
@@ -457,8 +599,8 @@ class GrabService : Service() {
                 }
                 
                 // 🚀 启动队列前先检查 Cookie
-                checkCookieValidity(currentSchool!!) { isValid ->
-                    if (!isValid) return@checkCookieValidity
+                checkCookieValidity(currentSchool!!) { probeResult ->
+                    if (!canContinueAfterSessionProbe(probeResult)) return@checkCookieValidity
                     
                     val modeText = if (isParallelMode && queue.size > 1) "并行队列抢课" else "直接队列抢课"
                     startForeground(NOTIFICATION_ID, createNotification("正在准备队列抢课..."))
@@ -512,7 +654,14 @@ class GrabService : Service() {
                 isRunning = true
                 
                 // 🔧 先获取隐藏参数，再启动模糊匹配轮询
-                fetchHiddenParamsAndStartFuzzyMatch(currentSchool!!)
+                // Run the shared preflight before the first fuzzy-selection
+                // request. Unknown must stop safely rather than poll.
+                checkCookieValidity(currentSchool!!) { probeResult ->
+                    if (!canContinueAfterSessionProbe(probeResult)) {
+                        return@checkCookieValidity
+                    }
+                    fetchHiddenParamsAndStartFuzzyMatch(currentSchool!!)
+                }
             }
             ACTION_STOP -> {
                 stopGrabbing()
@@ -617,6 +766,7 @@ class GrabService : Service() {
         val school = currentSchool ?: return
         if (courses.isEmpty()) {
             broadcastLog("并行任务为空，无法启动")
+            stopGrabbing()
             stopSelf()
             return
         }
@@ -671,16 +821,16 @@ class GrabService : Service() {
     }
 
     private fun runParallelTaskLoop(school: SchoolConfig, task: GrabTaskContext) {
-        if (!isRunning || task.cancelled || !activeGrabTasks.containsKey(task.workerId)) return
+        if (!isActiveParallelTask(task)) return
         if (task.retryCount >= maxRetry) {
             finishParallelTask(task, success = false, message = "已达最大重试次数")
             return
         }
 
         if (task.retryCount == 0 || task.retryCount % 200 == 0) {
-            checkCookieValidity(school) { isValid ->
-                if (!isRunning || task.cancelled || !activeGrabTasks.containsKey(task.workerId)) return@checkCookieValidity
-                if (!isValid) return@checkCookieValidity
+            checkCookieValidity(school) { probeResult ->
+                if (!isActiveParallelTask(task)) return@checkCookieValidity
+                if (!canContinueAfterSessionProbe(probeResult)) return@checkCookieValidity
                 proceedParallelHealthCheck(school, task)
             }
         } else {
@@ -690,7 +840,7 @@ class GrabService : Service() {
 
     private fun proceedParallelHealthCheck(school: SchoolConfig, task: GrabTaskContext) {
         checkServerHealth(school) { result ->
-            if (!isRunning || task.cancelled || !activeGrabTasks.containsKey(task.workerId)) return@checkServerHealth
+            if (!isActiveParallelTask(task)) return@checkServerHealth
             when (result) {
                 is ServerHealthCheckResult.Healthy -> {
                     task.retryCount++
@@ -716,8 +866,10 @@ class GrabService : Service() {
     }
 
     private fun fetchHiddenParamsAndProceed(school: SchoolConfig, task: GrabTaskContext) {
+        val requestContext = serviceRequestContext(school)
         Thread {
-            val hiddenHtml = CourseApiClient.getInstance().fetchPageHiddenParamsSync(school, serviceAccountStorageKey)
+            val hiddenHtml = CourseApiClient.getInstance().fetchPageHiddenParamsSync(school, requestContext)
+            if (!isCurrentServiceRequest(requestContext)) return@Thread
             val hiddenParams = parseHiddenParams(hiddenHtml ?: "")
             val merged = task.params.toMutableMap()
             hiddenParams.forEach { (key, value) ->
@@ -725,10 +877,9 @@ class GrabService : Service() {
                     merged[key] = value
                 }
             }
-            task.params = merged
-
-            handler.post {
-                if (!isRunning || task.cancelled || !activeGrabTasks.containsKey(task.workerId)) return@post
+            postForCurrentServiceRequest(requestContext) {
+                if (!isActiveParallelTask(task)) return@postForCurrentServiceRequest
+                task.params = merged
                 if (task.course.useExactMatch && !task.course.classId.isNullOrEmpty()) {
                     fetchSelectionDetails(school, task)
                 } else {
@@ -804,10 +955,15 @@ class GrabService : Service() {
             return
         }
 
-        CourseApiClient.getInstance().fetchAvailableCourses(school, buildCourseListBody(task.params, task.course), serviceAccountStorageKey, object : Callback {
+        val requestContext = serviceRequestContext(school)
+        CourseApiClient.getInstance().fetchAvailableCourses(
+            school,
+            buildCourseListBody(task.params, task.course),
+            requestContext,
+            guardedServiceCallback(requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 broadcastLog("线程 ${task.workerId} 获取课程列表失败: ${e.message}")
-                scheduleParallelTaskRetry(school, task)
+                scheduleParallelTaskRetry(school, task, requestContext)
             }
 
             override fun onResponse(call: Call, response: Response) {
@@ -831,26 +987,29 @@ class GrabService : Service() {
 
                     if (matched == null) {
                         broadcastLog("线程 ${task.workerId} 未找到课程：$targetName")
-                        scheduleParallelTaskRetry(school, task)
+                        scheduleParallelTaskRetry(school, task, requestContext)
                         return
                     }
 
-                    task.course.courseId = matched.courseId
-                    task.course.kklxdm = matched.kklxdm
-                    task.course._xkkz_id = matched._xkkz_id
-                    task.course._rwlx = matched._rwlx
-                    task.course._xklc = matched._xklc
-                    task.course.zyh_id = matched.zyh_id
-                    task.course.njdm_id = matched.njdm_id
-                    task.course.useExactMatch = false
-                    broadcastLog("线程 ${task.workerId} 匹配到：${matched.name}")
-                    handler.post { fetchSelectionDetails(school, task) }
+                    postForCurrentServiceRequest(requestContext) {
+                        if (!isActiveParallelTask(task)) return@postForCurrentServiceRequest
+                        task.course.courseId = matched.courseId
+                        task.course.kklxdm = matched.kklxdm
+                        task.course._xkkz_id = matched._xkkz_id
+                        task.course._rwlx = matched._rwlx
+                        task.course._xklc = matched._xklc
+                        task.course.zyh_id = matched.zyh_id
+                        task.course.njdm_id = matched.njdm_id
+                        task.course.useExactMatch = false
+                        broadcastLog("线程 ${task.workerId} 匹配到：${matched.name}")
+                        fetchSelectionDetails(school, task)
+                    }
                 } catch (e: Exception) {
                     broadcastLog("线程 ${task.workerId} 解析课程列表失败")
-                    scheduleParallelTaskRetry(school, task)
+                    scheduleParallelTaskRetry(school, task, requestContext)
                 }
             }
-        })
+        }))
     }
 
     private fun fetchSelectionDetails(school: SchoolConfig, task: GrabTaskContext) {
@@ -878,40 +1037,48 @@ class GrabService : Service() {
         formData["kch_id"] = course.courseId ?: ""
         val postBody = formData.entries.joinToString("&") { "${it.key}=${it.value}" }
 
-        CourseApiClient.getInstance().fetchCourseSelectionDetails(school, postBody, serviceAccountStorageKey, object : Callback {
+        val requestContext = serviceRequestContext(school)
+        CourseApiClient.getInstance().fetchCourseSelectionDetails(
+            school,
+            postBody,
+            requestContext,
+            guardedServiceCallback(requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 broadcastLog("线程 ${task.workerId} 获取详情失败: ${e.message}")
-                scheduleParallelTaskRetry(school, task)
+                scheduleParallelTaskRetry(school, task, requestContext)
             }
 
             override fun onResponse(call: Call, response: Response) {
                 val json = response.body?.string() ?: ""
                 val targetClassId = if (course.useExactMatch) course.classId else null
                 val details = parseSelectionDetails(json, targetClassId, course.teacher)
-                if (details != null) {
-                    executeSelection(school, task, details, rwlx, xklc)
-                } else if (!course.doJxbId.isNullOrEmpty() && !course.classId.isNullOrEmpty()) {
-                    val fallbackDetails = SelectionDetails(
-                        doJxbId = course.doJxbId!!,
-                        njdmId = course.njdm_id ?: "2024",
-                        zyhId = course.zyh_id ?: "",
-                        rlkz = course.rlkz ?: "0",
-                        rlzlkz = course.rlzlkz ?: "1",
-                        sxbj = course.sxbj ?: "0",
-                        xxkbj = course.xxkbj ?: "0",
-                        cxbj = "0",
-                        xkxnm = task.params["xkxnm"] ?: "2025",
-                        xkxqm = task.params["xkxqm"] ?: "12",
-                        jcxxId = course.jcxx_id ?: "",
-                        xkkzId = course._xkkz_id ?: ""
-                    )
-                    executeSelection(school, task, fallbackDetails, rwlx, xklc)
-                } else {
-                    broadcastLog("线程 ${task.workerId} 获取加密 ID 失败：${courseDisplayName(course)}")
-                    scheduleParallelTaskRetry(school, task)
+                postForCurrentServiceRequest(requestContext) {
+                    if (!isActiveParallelTask(task)) return@postForCurrentServiceRequest
+                    if (details != null) {
+                        executeSelection(school, task, details, rwlx, xklc)
+                    } else if (!course.doJxbId.isNullOrEmpty() && !course.classId.isNullOrEmpty()) {
+                        val fallbackDetails = SelectionDetails(
+                            doJxbId = course.doJxbId!!,
+                            njdmId = course.njdm_id ?: "2024",
+                            zyhId = course.zyh_id ?: "",
+                            rlkz = course.rlkz ?: "0",
+                            rlzlkz = course.rlzlkz ?: "1",
+                            sxbj = course.sxbj ?: "0",
+                            xxkbj = course.xxkbj ?: "0",
+                            cxbj = "0",
+                            xkxnm = task.params["xkxnm"] ?: "2025",
+                            xkxqm = task.params["xkxqm"] ?: "12",
+                            jcxxId = course.jcxx_id ?: "",
+                            xkkzId = course._xkkz_id ?: ""
+                        )
+                        executeSelection(school, task, fallbackDetails, rwlx, xklc)
+                    } else {
+                        broadcastLog("线程 ${task.workerId} 获取加密 ID 失败：${courseDisplayName(course)}")
+                        scheduleParallelTaskRetry(school, task, requestContext)
+                    }
                 }
             }
-        })
+        }))
     }
 
     private fun executeSelection(school: SchoolConfig, task: GrabTaskContext, details: SelectionDetails, rwlx: String, xklc: String) {
@@ -943,30 +1110,41 @@ class GrabService : Service() {
             .append("&jcxx_id=").append(details.jcxxId)
             .toString()
 
-        CourseApiClient.getInstance().selectCourse(school, postBody, serviceAccountStorageKey, object : Callback {
+        val requestContext = serviceRequestContext(school)
+        CourseApiClient.getInstance().selectCourse(
+            school,
+            postBody,
+            requestContext,
+            guardedServiceCallback(requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 broadcastLog("线程 ${task.workerId} 选课请求失败: ${e.message}")
-                scheduleParallelTaskRetry(school, task)
+                scheduleParallelTaskRetry(school, task, requestContext)
             }
 
             override fun onResponse(call: Call, response: Response) {
                 val result = response.body?.string() ?: ""
                 val success = result.contains("\"flag\":\"1\"") || result.contains("成功")
                 if (success) {
-                    verifyParallelSelectionAsync(school, task)
+                    postForCurrentServiceRequest(requestContext) {
+                        if (isActiveParallelTask(task)) {
+                            verifyParallelSelectionAsync(school, task)
+                        }
+                    }
                 } else {
                     val errorMsg = parseErrorMessage(result)
                     broadcastLog("线程 ${task.workerId} 第 ${task.retryCount} 次失败: $errorMsg")
-                    scheduleParallelTaskRetry(school, task)
+                    scheduleParallelTaskRetry(school, task, requestContext)
                 }
             }
-        })
+        }))
     }
 
     private fun verifyParallelSelectionAsync(school: SchoolConfig, task: GrabTaskContext) {
+        val requestContext = serviceRequestContext(school)
         Thread {
-            val verified = verifySelection(school, task.course.courseId ?: "")
-            handler.post {
+            val verified = verifySelection(school, task.course.courseId ?: "", requestContext)
+            postForCurrentServiceRequest(requestContext) {
+                if (!isActiveParallelTask(task)) return@postForCurrentServiceRequest
                 if (verified) {
                     broadcastLog("线程 ${task.workerId} 验证成功：${courseDisplayName(task.course)}")
                 } else {
@@ -977,17 +1155,30 @@ class GrabService : Service() {
         }.start()
     }
 
-    private fun scheduleParallelTaskRetry(school: SchoolConfig, task: GrabTaskContext) {
-        if (!isRunning || task.cancelled || !activeGrabTasks.containsKey(task.workerId)) return
+    private fun scheduleParallelTaskRetry(
+        school: SchoolConfig,
+        task: GrabTaskContext,
+        requestContext: SessionRequestContext? = null
+    ) {
+        val guardedContext = requestContext ?: currentSchool?.let(::serviceRequestContext) ?: return
+        if (!isCurrentServiceRequest(guardedContext)) return
+        if (!isActiveParallelTask(task)) return
         if (task.retryCount >= maxRetry) {
             finishParallelTask(task, success = false, message = "达到最大重试次数")
             return
         }
-        handler.postDelayed({ runParallelTaskLoop(school, task) }, interval.toLong())
+        postForCurrentServiceRequest(guardedContext, interval.toLong()) {
+            if (isActiveParallelTask(task)) {
+                runParallelTaskLoop(school, task)
+            }
+        }
     }
 
+    private fun isActiveParallelTask(task: GrabTaskContext): Boolean =
+        isRunning && !task.cancelled && activeGrabTasks[task.workerId] === task
+
     private fun finishParallelTask(task: GrabTaskContext, success: Boolean, message: String) {
-        if (!activeGrabTasks.containsKey(task.workerId)) return
+        if (activeGrabTasks[task.workerId] !== task) return
         activeGrabTasks.remove(task.workerId)
         activeWorkers.remove(task.workerId)
         task.cancelled = true
@@ -1027,10 +1218,15 @@ class GrabService : Service() {
         if (parallelTaskOrigin == "fuzzy" && !parallelTaskHadSuccess) {
             isFuzzyMatchMode = true
             isRunning = true
-            currentSchool?.let { school -> handler.postDelayed({ fetchHiddenParamsAndStartFuzzyMatch(school) }, interval.toLong()) }
+            currentSchool?.let { school ->
+                val requestContext = serviceRequestContext(school)
+                postForCurrentServiceRequest(requestContext, interval.toLong()) {
+                    fetchHiddenParamsAndStartFuzzyMatch(school)
+                }
+            }
             return
         }
-        isRunning = false
+        stopGrabbing()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -1094,6 +1290,9 @@ class GrabService : Service() {
     }
     
     private fun stopGrabbing() {
+        // Invalidate callbacks issued by the finished run before cancelling
+        // runnables.  A late probe must never restart a stopped task.
+        serviceRunId = NO_SERVICE_RUN
         isRunning = false
         isParallelTaskPoolRunning = false
         pendingGrabTasks.clear()
@@ -1138,9 +1337,12 @@ class GrabService : Service() {
                     broadcastLog("⏭️ 当前关键词未抢到，切换到下一个关键词...")
                     currentKeywordIndex++
                     isRunning = false
-                    handler.postDelayed({
-                        startSingleKeywordGrabbing(keywordQueue[currentKeywordIndex])
-                    }, 1000)
+                    val transitionContext = currentSchool?.let(::serviceRequestContext)
+                    if (transitionContext != null) {
+                        postForCurrentServiceRequest(transitionContext, 1000) {
+                            startSingleKeywordGrabbing(keywordQueue[currentKeywordIndex])
+                        }
+                    }
                     return
                 }
                 
@@ -1149,7 +1351,12 @@ class GrabService : Service() {
                     broadcastLog("⏭️ 自动切换到队列下一门课程...")
                     currentQueueIndex++
                     isRunning = false
-                    handler.postDelayed({ startNextQueueItem() }, 1000)
+                    val transitionContext = currentSchool?.let(::serviceRequestContext)
+                    if (transitionContext != null) {
+                        postForCurrentServiceRequest(transitionContext, 1000) {
+                            startNextQueueItem()
+                        }
+                    }
                     return
                 }
             }
@@ -1172,9 +1379,9 @@ class GrabService : Service() {
         // 🚀 定期检查 Cookie 有效性 (Server Health 检查前)
         // 策略：首次必须检查，后续每隔 200 次请求检查一次
         if (retryCount == 0 || retryCount % 200 == 0) {
-            checkCookieValidity(school) { isValid ->
+            checkCookieValidity(school) { probeResult ->
                 if (!isRunning) return@checkCookieValidity
-                if (!isValid) return@checkCookieValidity // 失效自动处理
+                if (!canContinueAfterSessionProbe(probeResult)) return@checkCookieValidity
 
                 // Cookie 有效，继续执行服务器检查
                 proceedToServerHealthCheck(school, course)
@@ -1221,35 +1428,139 @@ class GrabService : Service() {
         }
     }
     
-    // 检查 Cookie 有效性 (Pre-flight Check)
-    private fun checkCookieValidity(school: SchoolConfig, callback: (Boolean) -> Unit) {
-        CourseApiClient.getInstance().validateCookie(school, serviceAccountStorageKey, object : Callback {
+    // 检查 Cookie 有效性 (Pre-flight Check).  A missing name is not expiry
+    // evidence; all callers receive the frozen three-state result.
+    private fun checkCookieValidity(
+        school: SchoolConfig,
+        callback: (SessionProbeResult) -> Unit
+    ) {
+        val capturedRunId = serviceRunId
+        val requestContext = SessionRequestContext.forSchool(
+            school = school,
+            accountStorageKey = serviceAccountStorageKey,
+            purpose = SessionRequestPurpose.SESSION_PROBE,
+            owner = SessionRequestOwner.SERVICE,
+            activeContextEpoch = null,
+            serviceRunId = capturedRunId
+        )
+
+        CourseApiClient.getInstance().validateCookie(school, requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                // 网络错误暂时视为通过 (避免因网络波动误判为过期)
-                Log.w(TAG, "Cookie validity check failed (network error): ${e.message}")
-                handler.post { callback(true) }
+                Log.w(TAG, "Cookie validity probe did not complete: ${e.javaClass.simpleName}")
+                deliverProbeResult(
+                    requestContext,
+                    capturedRunId,
+                    SessionProbeResult.INDETERMINATE,
+                    null,
+                    callback
+                )
             }
 
             override fun onResponse(call: Call, response: Response) {
-                val html = response.body?.string() ?: ""
-                response.close()
-
-                // 判断逻辑：尝试解析学生姓名
-                val studentName = com.tyust.course.utils.CourseParser.parseStudentName(html)
-                val isValid = !studentName.isNullOrEmpty()
-
-                handler.post {
-                    if (isValid) {
-                        Log.d(TAG, "✅ Cookie 有效，学生姓名: $studentName")
-                        callback(true)
-                    } else {
-                        Log.e(TAG, "❌ Cookie 已失效，无法解析学生姓名")
-                        handleCookieInvalid()
-                        callback(false)
-                    }
+                val classification = try {
+                    val body = response.body?.string().orEmpty()
+                    SessionResponseClassifiers.classifyConsumedBody(
+                        requestContext,
+                        response,
+                        body
+                    )
+                } catch (e: Exception) {
+                    // A probe parser failure is not proof that the account is
+                    // expired.  Preserve the service's fail-safe branch.
+                    Log.w(TAG, "Cookie validity probe could not be classified: ${e.javaClass.simpleName}")
+                    null
+                } finally {
+                    response.close()
                 }
+                deliverProbeResult(
+                    requestContext,
+                    capturedRunId,
+                    classification?.let(::toSessionProbeResult)
+                        ?: SessionProbeResult.INDETERMINATE,
+                    classification,
+                    callback
+                )
             }
         })
+    }
+
+    private fun deliverProbeResult(
+        requestContext: SessionRequestContext,
+        capturedRunId: Long,
+        result: SessionProbeResult,
+        classification: SessionResponseClassification?,
+        callback: (SessionProbeResult) -> Unit
+    ) {
+        handler.post {
+            if (capturedRunId == NO_SERVICE_RUN || capturedRunId != serviceRunId) {
+                Log.d(TAG, "Discarding stale service session probe")
+                return@post
+            }
+            if (!SessionRegistry.isCurrent(
+                    requestContext.normalizedAccountStorageKey,
+                    requestContext.sessionGeneration
+                )
+            ) {
+                Log.d(TAG, "Discarding stale account session probe")
+                return@post
+            }
+            callback(result)
+            // The service owns this response body and has verified its own
+            // run id above.  Only then may a confirmed result enter the
+            // registry/broadcast pipeline; indeterminate never reports.
+            if (result == SessionProbeResult.CONFIRMED_EXPIRED && classification != null) {
+                CourseApiClient.getInstance().reportSessionClassification(requestContext, classification)
+            }
+        }
+    }
+
+    private fun toSessionProbeResult(
+        classification: SessionResponseClassification
+    ): SessionProbeResult = when (classification.state) {
+        SessionResponseState.VALID -> SessionProbeResult.VALID
+        SessionResponseState.CONFIRMED_EXPIRED -> SessionProbeResult.CONFIRMED_EXPIRED
+        SessionResponseState.INDETERMINATE -> SessionProbeResult.INDETERMINATE
+    }
+
+    private fun canContinueAfterSessionProbe(result: SessionProbeResult): Boolean = when (result) {
+        SessionProbeResult.VALID -> true
+        SessionProbeResult.CONFIRMED_EXPIRED -> {
+            handleCookieInvalid()
+            false
+        }
+        SessionProbeResult.INDETERMINATE -> {
+            handleSessionIndeterminate()
+            false
+        }
+    }
+
+    private fun handleSessionIndeterminate() {
+        // Do not convert an unknown response shape, an incomplete body, or a
+        // transient network failure into a login-expiry event.  The queue is
+        // deliberately retained by stopGrabbing(), but no submission loop is
+        // left running and no automatic recovery is scheduled.
+        stopGrabbing()
+
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("⚠️ 无法确认登录状态")
+            .setContentText("抢课已安全停止：登录状态或响应结构无法确认。")
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .build()
+
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(NOTIFICATION_ID + 1, notification)
+        broadcastLog("⚠️ 无法确认登录状态或响应结构异常，已安全停止抢课")
+        broadcastUpdate("⚠️ 无法确认登录状态，抢课已安全停止")
     }
 
     private fun handleCookieInvalid() {
@@ -1284,13 +1595,23 @@ class GrabService : Service() {
     // 检查服务器健康状态（复用 CourseApiClient 的统一网络栈，探测真实教务路径）
     private fun checkServerHealth(school: SchoolConfig, callback: (ServerHealthCheckResult) -> Unit) {
         val startTime = SystemClock.elapsedRealtime()
+        val capturedRunId = serviceRunId
+        val requestContext = SessionRequestContext.forSchool(
+            school = school,
+            accountStorageKey = serviceAccountStorageKey,
+            purpose = SessionRequestPurpose.SESSION_PROBE,
+            owner = SessionRequestOwner.SERVICE,
+            activeContextEpoch = null,
+            serviceRunId = capturedRunId
+        )
 
-        CourseApiClient.getInstance().checkServerHealth(school, serviceAccountStorageKey, pingTimeoutMs, object : Callback {
+        CourseApiClient.getInstance().checkServerHealth(school, requestContext, pingTimeoutMs, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 val responseTime = SystemClock.elapsedRealtime() - startTime
                 val reason = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
                 Log.w(TAG, "Server health check failed: $reason (${responseTime}ms)")
                 handler.post {
+                    if (!isCurrentServiceRequest(requestContext, capturedRunId)) return@post
                     if (responseTime >= pingTimeoutMs) {
                         callback(ServerHealthCheckResult.Slow(responseTime))
                     } else {
@@ -1306,6 +1627,7 @@ class GrabService : Service() {
                 response.close()
 
                 handler.post {
+                    if (!isCurrentServiceRequest(requestContext, capturedRunId)) return@post
                     if (responseTime >= pingTimeoutMs) {
                         callback(ServerHealthCheckResult.Slow(responseTime))
                     } else if (isSuccessful || code in 300..399) {
@@ -1317,17 +1639,36 @@ class GrabService : Service() {
             }
         })
     }
+
+    private fun isCurrentServiceRequest(
+        requestContext: SessionRequestContext,
+        capturedRunId: Long
+    ): Boolean = capturedRunId != NO_SERVICE_RUN &&
+        capturedRunId == serviceRunId &&
+        SessionRegistry.isCurrent(
+            requestContext.normalizedAccountStorageKey,
+            requestContext.sessionGeneration
+        )
+
+    private fun isCurrentServiceRequest(requestContext: SessionRequestContext): Boolean =
+        isCurrentServiceRequest(
+            requestContext,
+            requestContext.serviceRunId ?: NO_SERVICE_RUN
+        )
     
     // Step 0: 获取页面隐藏参数后继续选课流程
     private fun fetchHiddenParamsAndProceed(school: SchoolConfig, course: Course) {
+        val requestContext = serviceRequestContext(school)
         // 使用线程池异步获取隐藏参数
         Thread {
-            val hiddenHtml = CourseApiClient.getInstance().fetchPageHiddenParamsSync(school, serviceAccountStorageKey)
+            val hiddenHtml = CourseApiClient.getInstance().fetchPageHiddenParamsSync(school, requestContext)
+            if (!isCurrentServiceRequest(requestContext)) return@Thread
             val hiddenParams = parseHiddenParams(hiddenHtml ?: "")
             
             Log.d(TAG, "Step 0: 获取隐藏参数完成，共 ${hiddenParams.size} 个")
             
             // 合并到 courseParams
+            var mergedCourseParams: Map<String, String>? = null
             if (hiddenParams.isNotEmpty()) {
                 val merged = (courseParams ?: emptyMap()).toMutableMap()
                 hiddenParams.forEach { (key, value) ->
@@ -1335,18 +1676,22 @@ class GrabService : Service() {
                         merged[key] = value
                     }
                 }
-                courseParams = merged
+                mergedCourseParams = merged
             }
             
             // 🔧 根据模式选择不同的处理流程
             if (course.useExactMatch && !course.classId.isNullOrEmpty()) {
                 // 精确模式：直接使用保存的 classId
                 Log.d(TAG, "🔒 精确模式: 使用保存的 classId=${course.classId}")
-                handler.post { fetchSelectionDetails(school, course) }
+                postForCurrentServiceRequest(requestContext) {
+                    mergedCourseParams?.let { courseParams = it }
+                    fetchSelectionDetails(school, course)
+                }
             } else {
                 // 🔧 新智能模式：获取所有可选课程→本地匹配→获取详情→匹配教学班
                 Log.d(TAG, "🔄 智能模式: 获取所有课程并匹配 ${course.name} | ${course.teacher} | ${course.time}")
-                handler.post { 
+                postForCurrentServiceRequest(requestContext) {
+                    mergedCourseParams?.let { courseParams = it }
                     broadcastLog("🔄 智能模式: 获取课程列表...")
                     smartModeMatchFromAllCourses(school, course) 
                 }
@@ -1427,10 +1772,15 @@ class GrabService : Service() {
         Log.d(TAG, "智能模式请求参数数量: ${formData.size}, 课程名: $searchName")
         val postBody = formData.entries.joinToString("&") { "${it.key}=${it.value}" }
         
-        CourseApiClient.getInstance().fetchAvailableCourses(school, postBody, serviceAccountStorageKey, object : Callback {
+        val requestContext = serviceRequestContext(school)
+        CourseApiClient.getInstance().fetchAvailableCourses(
+            school,
+            postBody,
+            requestContext,
+            guardedServiceCallback(requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 broadcastLog("❌ 搜索课程失败: ${e.message}")
-                scheduleNextAttempt()
+                scheduleNextAttempt(requestContext)
             }
             
             override fun onResponse(call: Call, response: Response) {
@@ -1453,30 +1803,30 @@ class GrabService : Service() {
                         Log.d(TAG, "✅ 智能模式匹配成功: ${matched.name} | ${matched.teacher} | classId=${matched.classId}")
                         broadcastLog("✅ 匹配到课程: ${matched.teacher ?: "未知老师"}")
                         
-                        // 更新 targetCourse 的 ID
-                        targetCourse.classId = matched.classId
-                        targetCourse.courseId = matched.courseId
-                        targetCourse.kklxdm = matched.kklxdm
-                        targetCourse._xkkz_id = matched._xkkz_id
-                        targetCourse._rwlx = matched._rwlx
-                        targetCourse._xklc = matched._xklc
-                        // 🔧 智能模式匹配，确保不走精确模式
-                        targetCourse.useExactMatch = false
-                        
-                        // 继续选课流程
-                        fetchSelectionDetails(school, targetCourse)
+                        postForCurrentServiceRequest(requestContext) {
+                            // Publish the match only after validating the
+                            // original service run and session generation.
+                            targetCourse.classId = matched.classId
+                            targetCourse.courseId = matched.courseId
+                            targetCourse.kklxdm = matched.kklxdm
+                            targetCourse._xkkz_id = matched._xkkz_id
+                            targetCourse._rwlx = matched._rwlx
+                            targetCourse._xklc = matched._xklc
+                            targetCourse.useExactMatch = false
+                            fetchSelectionDetails(school, targetCourse)
+                        }
 
                     } else {
                         broadcastLog("❌ 未找到匹配的课程: ${targetCourse.name}")
-                        scheduleNextAttempt()
+                        scheduleNextAttempt(requestContext)
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "智能模式解析失败: ${e.message}")
                     broadcastLog("❌ 解析课程列表失败")
-                    scheduleNextAttempt()
+                    scheduleNextAttempt(requestContext)
                 }
             }
-        })
+        }))
     }
     
     // 🔧 新智能模式：获取所有可选课程，本地匹配课程名，然后获取详情匹配教学班
@@ -1487,12 +1837,13 @@ class GrabService : Service() {
             scheduleNextAttempt()
             return
         }
+        val requestContext = serviceRequestContext(school)
         
         // 🔧 优先使用缓存的课程列表（如果有）
         if (cachedAllCourses.isNotEmpty()) {
             Log.d(TAG, "🔄 智能模式: 使用缓存课程 (${cachedAllCourses.size}门)")
             broadcastLog("📋 使用缓存 ${cachedAllCourses.size} 门课程")
-            matchCourseFromList(school, targetCourse, cachedAllCourses)
+            matchCourseFromList(school, targetCourse, cachedAllCourses, requestContext)
             return
         }
         
@@ -1570,10 +1921,14 @@ class GrabService : Service() {
         Log.d(TAG, "🔄 智能模式: 获取所有课程 (参数数: ${formData.size})")
         val postBody = formData.entries.joinToString("&") { "${it.key}=${it.value}" }
         
-        CourseApiClient.getInstance().fetchAvailableCourses(school, postBody, serviceAccountStorageKey, object : Callback {
+        CourseApiClient.getInstance().fetchAvailableCourses(
+            school,
+            postBody,
+            requestContext,
+            guardedServiceCallback(requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 broadcastLog("❌ 获取课程列表失败: ${e.message}")
-                scheduleNextAttempt()
+                scheduleNextAttempt(requestContext)
             }
             
             override fun onResponse(call: Call, response: Response) {
@@ -1585,7 +1940,7 @@ class GrabService : Service() {
                     
                     if (courses.isEmpty()) {
                         broadcastLog("❌ 课程列表为空")
-                        scheduleNextAttempt()
+                        scheduleNextAttempt(requestContext)
                         return
                     }
                     
@@ -1643,7 +1998,7 @@ class GrabService : Service() {
                     
                     if (scoredCourses.isEmpty()) {
                         broadcastLog("❌ 未找到课程: $targetName")
-                        scheduleNextAttempt()
+                        scheduleNextAttempt(requestContext)
                         return
                     }
                     
@@ -1652,31 +2007,34 @@ class GrabService : Service() {
                     Log.d(TAG, "✅ 智能模式匹配: ${matched.name} (${scoredCourses.first().score}分) | courseId=${matched.courseId}")
                     broadcastLog("✅ 匹配到: ${matched.name} (${scoredCourses.first().score}分)")
                     
-                    // 🔧 更新目标课程的关键参数
-                    targetCourse.courseId = matched.courseId
-                    targetCourse.kklxdm = matched.kklxdm
-                    targetCourse._xkkz_id = matched._xkkz_id
-                    targetCourse._rwlx = matched._rwlx
-                    targetCourse._xklc = matched._xklc
-                    targetCourse.zyh_id = matched.zyh_id
-                    targetCourse.njdm_id = matched.njdm_id
-                    // 🔧 不设置 classId，让 fetchSelectionDetails 通过老师/时间匹配教学班
-                    targetCourse.useExactMatch = false
-                    
-                    // 继续获取详情 (fetchSelectionDetails 会通过老师匹配教学班)
-                    handler.post { fetchSelectionDetails(school, targetCourse) }
+                    postForCurrentServiceRequest(requestContext) {
+                        targetCourse.courseId = matched.courseId
+                        targetCourse.kklxdm = matched.kklxdm
+                        targetCourse._xkkz_id = matched._xkkz_id
+                        targetCourse._rwlx = matched._rwlx
+                        targetCourse._xklc = matched._xklc
+                        targetCourse.zyh_id = matched.zyh_id
+                        targetCourse.njdm_id = matched.njdm_id
+                        targetCourse.useExactMatch = false
+                        fetchSelectionDetails(school, targetCourse)
+                    }
                     
                 } catch (e: Exception) {
                     Log.e(TAG, "智能模式解析失败: ${e.message}")
                     broadcastLog("❌ 解析课程列表失败")
-                    scheduleNextAttempt()
+                    scheduleNextAttempt(requestContext)
                 }
             }
-        })
+        }))
     }
     
     // 🔧 从课程列表中匹配目标课程（供smartModeMatchFromAllCourses和缓存复用）
-    private fun matchCourseFromList(school: SchoolConfig, targetCourse: Course, courses: List<Course>) {
+    private fun matchCourseFromList(
+        school: SchoolConfig,
+        targetCourse: Course,
+        courses: List<Course>,
+        requestContext: SessionRequestContext
+    ) {
         // 🔧 关键修复：确保从队列中同步最新的老师/时间要求
         val queue = serviceQueue
         val queueCourse = queue.find { it.name == targetCourse.name }
@@ -1762,7 +2120,9 @@ class GrabService : Service() {
         targetCourse.useExactMatch = false
         
         // 继续获取详情
-        handler.post { fetchSelectionDetails(school, targetCourse) }
+        postForCurrentServiceRequest(requestContext) {
+            fetchSelectionDetails(school, targetCourse)
+        }
     }
     
     // 解析HTML页面中的隐藏参数 (与CourseListRoute保持一致)
@@ -1867,23 +2227,31 @@ class GrabService : Service() {
         
         Log.d(TAG, "fetchSelectionDetails 参数数量: ${formData.size}")
         
-        CourseApiClient.getInstance().fetchCourseSelectionDetails(school, postBody, serviceAccountStorageKey,
+        val requestContext = serviceRequestContext(school)
+        CourseApiClient.getInstance().fetchCourseSelectionDetails(school, postBody, requestContext,
             object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
+                    if (!isCurrentServiceRequest(requestContext)) return
                     failCount++
                     broadcastUpdate("❌ 获取详情失败: ${e.message}")
-                    scheduleNextAttempt()
+                    scheduleNextAttempt(requestContext)
                 }
                 
                 override fun onResponse(call: Call, response: Response) {
+                    if (!isCurrentServiceRequest(requestContext)) {
+                        response.close()
+                        return
+                    }
                     val json = response.body?.string() ?: ""
                     // 🔧 智能模式时不传 classId，让 parseSelectionDetails 匹配第一个或按老师匹配
                     val targetClassId = if (course.useExactMatch) course.classId else null
                     val details = parseSelectionDetails(json, targetClassId, course.teacher)
                     
-                    if (details != null) {
-                        executeSelection(school, course, details, rwlx, xklc)
-                    } else {
+                    postForCurrentServiceRequest(requestContext) {
+                        if (details != null) {
+                            executeSelection(school, course, details, rwlx, xklc)
+                            return@postForCurrentServiceRequest
+                        }
                         // 🔧 Fallback: 如果解析失败（如返回"0"）但我们有保存的 doJxbId，直接尝试抢课
                         if (!course.doJxbId.isNullOrEmpty() && !course.classId.isNullOrEmpty()) {
                             Log.w(TAG, "⚠️ 解析失败，强制使用保存的 doJxbId=${course.doJxbId}")
@@ -1904,12 +2272,12 @@ class GrabService : Service() {
                                 xkkzId = course._xkkz_id ?: ""
                             )
                             executeSelection(school, course, fallbackDetails, rwlx, xklc)
-                            return
+                            return@postForCurrentServiceRequest
                         }
                         
                         failCount++
                         broadcastUpdate("❌ 获取加密ID失败")
-                        scheduleNextAttempt()
+                        scheduleNextAttempt(requestContext)
                     }
                 }
             }
@@ -2059,28 +2427,35 @@ class GrabService : Service() {
         postBody.append("&xkxqm=").append(details.xkxqm)
         postBody.append("&jcxx_id=").append(details.jcxxId)  // Web版关键参数
         
-        CourseApiClient.getInstance().selectCourse(school, postBody.toString(), serviceAccountStorageKey, object : Callback {
+        val requestContext = serviceRequestContext(school)
+        CourseApiClient.getInstance().selectCourse(school, postBody.toString(), requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                if (!isCurrentServiceRequest(requestContext)) return
                 failCount++
                 broadcastUpdate("❌ 选课请求失败: ${e.message}")
-                scheduleNextAttempt()
+                scheduleNextAttempt(requestContext)
             }
             
             override fun onResponse(call: Call, response: Response) {
+                if (!isCurrentServiceRequest(requestContext)) {
+                    response.close()
+                    return
+                }
                 val result = response.body?.string() ?: ""
                 val success = result.contains("\"flag\":\"1\"") || result.contains("成功")
                 
                 if (success) {
-                    successCount++
-                    broadcastUpdate("🎉 抢课成功！${course.name}")
-                    
-                    // Step 3: 验证选课结果 (Web版 verifyCourseSelection)
-                    verifySelectionAsync(school, course)
+                    postForCurrentServiceRequest(requestContext) {
+                        successCount++
+                        broadcastUpdate("🎉 抢课成功！${course.name}")
+                        // Step 3: 验证选课结果 (Web版 verifyCourseSelection)
+                        verifySelectionAsync(school, course)
+                    }
                 } else {
                     failCount++
                     val errorMsg = parseErrorMessage(result)
                     broadcastUpdate("❌ 第 $retryCount 次失败: $errorMsg")
-                    scheduleNextAttempt()
+                    scheduleNextAttempt(requestContext)
                 }
             }
         })
@@ -2088,10 +2463,12 @@ class GrabService : Service() {
     
     // Step 3: 异步验证选课结果
     private fun verifySelectionAsync(school: SchoolConfig, course: Course) {
+        val requestContext = serviceRequestContext(school)
         Thread {
-            val verified = verifySelection(school, course.courseId ?: "")
+            val verified = verifySelection(school, course.courseId ?: "", requestContext)
+            if (!isCurrentServiceRequest(requestContext)) return@Thread
             
-            handler.post {
+            postForCurrentServiceRequest(requestContext) {
                 if (verified) {
                     broadcastLog("✅ 验证成功: 课程已加入已选列表")
                 } else {
@@ -2121,10 +2498,10 @@ class GrabService : Service() {
                     
                     // 处理下一个关键词
                     currentKeywordIndex++
-                    handler.postDelayed({
+                    postForCurrentServiceRequest(requestContext, 2000) {
                         startSingleKeywordGrabbing(keywordQueue[currentKeywordIndex])
-                    }, 2000) // 等待2秒后处理下一个
-                    return@post
+                    }
+                    return@postForCurrentServiceRequest
                 }
                 
                 // 🔧 队列模式抢到后继续下一个
@@ -2132,7 +2509,7 @@ class GrabService : Service() {
                     val currentQueue = serviceQueue
                     if (currentQueue.isEmpty()) {
                         broadcastLog("🎊 队列处理完成！共抢到 $totalQueueSuccess 门课程")
-                        isRunning = false
+                        stopGrabbing()
                         stopForeground(STOP_FOREGROUND_REMOVE)
                         stopSelf()
                     } else {
@@ -2145,9 +2522,9 @@ class GrabService : Service() {
                         broadcastLog("🎉 课程「${course.name}」抢课成功！继续队列下一门...")
                         totalQueueSuccess++
                         // 1.5秒后开始下一门
-                        handler.postDelayed({ startNextQueueItem() }, 1500)
+                        postForCurrentServiceRequest(requestContext, 1500) { startNextQueueItem() }
                     }
-                    return@post
+                    return@postForCurrentServiceRequest
                 }
                 
                 // 所有处理完成
@@ -2159,7 +2536,7 @@ class GrabService : Service() {
                 }
                 updateNotification("✅ 抢课成功！${course.name}")
                 
-                isRunning = false
+                stopGrabbing()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
@@ -2167,9 +2544,18 @@ class GrabService : Service() {
     }
     
     // 验证选课是否成功 (Web版 verifyCourseSelection)
-    private fun verifySelection(school: SchoolConfig, courseId: String): Boolean {
+    private fun verifySelection(
+        school: SchoolConfig,
+        courseId: String,
+        requestContext: SessionRequestContext
+    ): Boolean {
         try {
-            val selectedCoursesJson = CourseApiClient.getInstance().fetchSelectedCoursesSync(school, "", serviceAccountStorageKey)
+            val selectedCoursesJson = CourseApiClient.getInstance().fetchSelectedCoursesSync(
+                school,
+                "",
+                requestContext
+            )
+            if (!isCurrentServiceRequest(requestContext)) return false
             if (selectedCoursesJson == null) return false
             
             val arr = JSONArray(selectedCoursesJson)
@@ -2200,9 +2586,15 @@ class GrabService : Service() {
         }
     }
     
-    private fun scheduleNextAttempt() {
+    private fun scheduleNextAttempt(requestContext: SessionRequestContext? = null) {
+        val guardedContext = requestContext ?: currentSchool?.let(::serviceRequestContext) ?: return
+        if (!isCurrentServiceRequest(guardedContext)) return
         if (!isRunning) return
-        grabRunnable = Runnable { runGrabLoop() }
+        grabRunnable = Runnable {
+            if (isCurrentServiceRequest(guardedContext) && isRunning) {
+                runGrabLoop()
+            }
+        }
         handler.postDelayed(grabRunnable!!, interval.toLong())
     }
     
@@ -2316,6 +2708,7 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
         
         if (keywordQueue.isEmpty()) {
             broadcastLog("❌ 未提供有效的课程关键词")
+            stopGrabbing()
             stopSelf()
             return
         }
@@ -2339,6 +2732,8 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
     
     // 并行抢课：同时处理多个关键词
     private fun startParallelGrabbing() {
+        val school = currentSchool ?: return
+        val requestContext = serviceRequestContext(school)
         val workersToStart = minOf(parallelWorkerCount, keywordQueue.size)
         broadcastLog("⚡ 并行启动 $workersToStart 个抢课任务")
         
@@ -2350,9 +2745,9 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
                 activeWorkers.add(workerId)
                 
                 // 延迟启动以避免同时请求导致服务器拒绝
-                handler.postDelayed({
+                postForCurrentServiceRequest(requestContext, (i * 500).toLong()) {
                     startParallelWorker(workerId, keywordQueue[i])
-                }, (i * 500).toLong())
+                }
             }
         }
     }
@@ -2405,31 +2800,46 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
         keywordFetchRetryCount++
         broadcastLog("📚 获取选课参数 (第${keywordFetchRetryCount}/${MAX_FETCH_RETRIES}次)...")
         
-        CourseApiClient.getInstance().fetchCourseParams(school, serviceAccountStorageKey, object : Callback {
+        val requestContext = serviceRequestContext(school)
+        CourseApiClient.getInstance().fetchCourseParams(school, requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                if (!isCurrentServiceRequest(requestContext)) return
                 broadcastLog("⚠️ 请求失败: ${e.message}")
-                retryOrFail("网络错误")
+                retryOrFail("网络错误", requestContext)
             }
             
             override fun onResponse(call: Call, response: Response) {
-                val html = response.body?.string() ?: ""
-                if (html.isEmpty()) {
-                    retryOrFail("响应为空")
+                if (!isCurrentServiceRequest(requestContext)) {
+                    response.close()
                     return
                 }
-                parseIndexParamsAndStart(html)
+                val html = response.body?.string() ?: ""
+                if (html.isEmpty()) {
+                    retryOrFail("响应为空", requestContext)
+                    return
+                }
+                postForCurrentServiceRequest(requestContext) {
+                    parseIndexParamsAndStart(html)
+                }
             }
         })
     }
     
-    private fun retryOrFail(reason: String) {
+    private fun retryOrFail(
+        reason: String,
+        requestContext: SessionRequestContext? = null
+    ) {
+        val guardedContext = requestContext ?: currentSchool?.let(::serviceRequestContext) ?: return
+        if (!isCurrentServiceRequest(guardedContext)) return
+        if (!isRunning || serviceRunId == NO_SERVICE_RUN) return
         if (keywordFetchRetryCount < MAX_FETCH_RETRIES) {
             broadcastLog("⏳ ${reason}，${FETCH_RETRY_DELAY/1000}秒后重试...")
-            handler.postDelayed({
-                if (isRunning || keywordFetchRetryCount < MAX_FETCH_RETRIES) {
+            val retry = {
+                if (isRunning && keywordFetchRetryCount < MAX_FETCH_RETRIES) {
                     fetchCourseParamsWithRetry()
                 }
-            }, FETCH_RETRY_DELAY)
+            }
+            postForCurrentServiceRequest(guardedContext, FETCH_RETRY_DELAY, retry)
         } else {
             broadcastLog("❌ 连续${MAX_FETCH_RETRIES}次获取失败")
             
@@ -2443,15 +2853,15 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
                 broadcastLog("⏭️ 当前课程获取失败，切换到下一个关键词...")
                 currentKeywordIndex++
                 isRunning = false  // 重置以便下一个关键词可以启动
-                
-                handler.postDelayed({
+                postForCurrentServiceRequest(guardedContext, 1000) {
                     startSingleKeywordGrabbing(keywordQueue[currentKeywordIndex])
-                }, 1000)
+                }
             } else {
                 // 没有更多关键词，停止服务
                 if (keywordQueue.size > 1) {
                     broadcastLog("🏁 全部关键词处理完成，成功: $multiKeywordTotalSuccess/${keywordQueue.size}")
                 }
+                stopGrabbing()
                 stopSelf()
             }
         }
@@ -2537,22 +2947,33 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
         broadcastLog("📂 获取分类 $currentTabIndex/${tabParamsList.size} (kklxdm=${tab.kklxdm})...")
         
         // 先获取 Display 页面参数
+        val requestContext = serviceRequestContext(school)
         CourseApiClient.getInstance().fetchCourseDisplayParams(
-            school, tab.xkkz_id, tab.kklxdm, tab.njdm_id, tab.zyh_id, serviceAccountStorageKey,
+            school, tab.xkkz_id, tab.kklxdm, tab.njdm_id, tab.zyh_id, requestContext,
             object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
+                    if (!isCurrentServiceRequest(requestContext)) return
                     // 失败则跳过 Display 参数，直接获取课程列表
-                    fetchCategoryList(tab)
+                    postForCurrentServiceRequest(requestContext) {
+                        fetchCategoryList(tab)
+                    }
                 }
                 
                 override fun onResponse(call: Call, response: Response) {
-                    val html = response.body?.string() ?: ""
-                    // 解析 Display 参数
-                    val pattern = """<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>""".toRegex()
-                    pattern.findAll(html).forEach { match ->
-                        displayParams[match.groupValues[1]] = match.groupValues[2]
+                    if (!isCurrentServiceRequest(requestContext)) {
+                        response.close()
+                        return
                     }
-                    fetchCategoryList(tab)
+                    val html = response.body?.string() ?: ""
+                    postForCurrentServiceRequest(requestContext) {
+                        // Parse and publish the Display parameters only while
+                        // this exact service generation remains current.
+                        val pattern = """<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>""".toRegex()
+                        pattern.findAll(html).forEach { match ->
+                            displayParams[match.groupValues[1]] = match.groupValues[2]
+                        }
+                        fetchCategoryList(tab)
+                    }
                 }
             }
         )
@@ -2665,23 +3086,32 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
         
         Log.d(TAG, "📄 请求页面: kspage=$currentKspage, jspage=$currentJspage, 参数数量=${formData.size}")
         
-        CourseApiClient.getInstance().fetchAvailableCourses(school, postBody, serviceAccountStorageKey, object : Callback {
+        val requestContext = serviceRequestContext(school)
+        CourseApiClient.getInstance().fetchAvailableCourses(school, postBody, requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                if (!isCurrentServiceRequest(requestContext)) return
                 // 请求失败，停止这个分类的获取，继续下一个分类
                 Log.e(TAG, "获取页面失败: ${e.message}")
-                fetchNextCategory()
+                postForCurrentServiceRequest(requestContext) {
+                    fetchNextCategory()
+                }
             }
             
             override fun onResponse(call: Call, response: Response) {
-                try {
-                    val json = response.body?.string() ?: ""
+                if (!isCurrentServiceRequest(requestContext)) {
+                    response.close()
+                    return
+                }
+                val json = response.body?.string() ?: ""
+                postForCurrentServiceRequest(requestContext) {
+                    try {
                     val parsed = parseCourseListFromJson(json)
                     
                     if (parsed.isEmpty()) {
                         // 没有更多数据，这个分类获取完成
                         Log.d(TAG, "✅ 分类 ${tab.kklxdm} 页面 kspage=$currentKspage 没有数据，分类获取完成")
                         fetchNextCategory()
-                        return
+                        return@postForCurrentServiceRequest
                     }
                     
                     // 补充分类参数
@@ -2702,9 +3132,10 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
                     // 递归获取下一页
                     fetchCategoryPage()
                     
-                } catch (e: Exception) {
-                    Log.e(TAG, "解析页面失败: ${e.message}")
-                    fetchNextCategory()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "解析页面失败: ${e.message}")
+                        fetchNextCategory()
+                    }
                 }
             }
         })
@@ -2738,15 +3169,18 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
                 broadcastLog("⏭️ 当前课程未找到，切换到下一个关键词...")
                 currentKeywordIndex++
                 isRunning = false
-                
-                handler.postDelayed({
-                    startSingleKeywordGrabbing(keywordQueue[currentKeywordIndex])
-                }, 1000)
+                val transitionContext = currentSchool?.let(::serviceRequestContext)
+                if (transitionContext != null) {
+                    postForCurrentServiceRequest(transitionContext, 1000) {
+                        startSingleKeywordGrabbing(keywordQueue[currentKeywordIndex])
+                    }
+                }
             } else {
                 // 没有更多关键词
                 if (keywordQueue.size > 1) {
                     broadcastLog("🏁 全部关键词处理完成，成功: $multiKeywordTotalSuccess/${keywordQueue.size}")
                 }
+                stopGrabbing()
                 stopSelf()
             }
             return
@@ -2858,13 +3292,21 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
         
         broadcastLog("📋 获取课程详情，匹配教学班...")
         
-        CourseApiClient.getInstance().fetchCourseSelectionDetails(school, detailBody.toString(), serviceAccountStorageKey, object : Callback {
+        val requestContext = serviceRequestContext(school)
+        CourseApiClient.getInstance().fetchCourseSelectionDetails(school, detailBody.toString(), requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                if (!isCurrentServiceRequest(requestContext)) return
                 broadcastLog("⚠️ 获取课程详情失败: ${e.message}")
-                handleFallback(baseCourse, queueCourse)
+                postForCurrentServiceRequest(requestContext) {
+                    handleFallback(baseCourse, queueCourse)
+                }
             }
             
             override fun onResponse(call: Call, response: Response) {
+                if (!isCurrentServiceRequest(requestContext)) {
+                    response.close()
+                    return
+                }
                 val body = response.body?.string() ?: ""
                 
                 try {
@@ -2901,7 +3343,10 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
                         }
                         
                         if (matchedClass != null) {
-                            useMatchedCourseAndGrab(matchedClass)
+                            val selectedMatch = requireNotNull(matchedClass)
+                            postForCurrentServiceRequest(requestContext) {
+                                useMatchedCourseAndGrab(selectedMatch)
+                            }
                             return
                         } else {
                             broadcastLog("⚠️ 精确匹配失败，回退到智能匹配")
@@ -2956,15 +3401,22 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
                     
                     if (matchedClass != null) {
                         broadcastLog("✅ 智能匹配成功: ${matchedClass.teacher} | ${matchedClass.time}")
-                        useMatchedCourseAndGrab(matchedClass)
+                        val selectedMatch = requireNotNull(matchedClass)
+                        postForCurrentServiceRequest(requestContext) {
+                            useMatchedCourseAndGrab(selectedMatch)
+                        }
                     } else {
                         broadcastLog("⚠️ 未找到匹配的教学班，随机尝试...")
-                        handleFallback(baseCourse, queueCourse)
+                        postForCurrentServiceRequest(requestContext) {
+                            handleFallback(baseCourse, queueCourse)
+                        }
                     }
                     
                 } catch (e: Exception) {
                     broadcastLog("⚠️ 解析课程详情失败: ${e.message}")
-                    handleFallback(baseCourse, queueCourse)
+                    postForCurrentServiceRequest(requestContext) {
+                        handleFallback(baseCourse, queueCourse)
+                    }
                 }
             }
         })
@@ -3122,14 +3574,17 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
      * 获取隐藏参数并启动模糊匹配轮询
      */
     private fun fetchHiddenParamsAndStartFuzzyMatch(school: SchoolConfig) {
+        val requestContext = serviceRequestContext(school)
         broadcastLog("📌 正在获取选课参数...")
         
         Thread {
-            val hiddenHtml = CourseApiClient.getInstance().fetchPageHiddenParamsSync(school, serviceAccountStorageKey)
+            val hiddenHtml = CourseApiClient.getInstance().fetchPageHiddenParamsSync(school, requestContext)
+            if (!isCurrentServiceRequest(requestContext)) return@Thread
             val hiddenParams = parseHiddenParams(hiddenHtml ?: "")
             
             Log.d(TAG, "模糊匹配: 获取隐藏参数完成，共 ${hiddenParams.size} 个")
-            
+
+            var mergedCourseParams: Map<String, String>? = null
             // 合并到 courseParams
             if (hiddenParams.isNotEmpty()) {
                 val merged = (courseParams ?: emptyMap()).toMutableMap()
@@ -3138,10 +3593,11 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
                         merged[key] = value
                     }
                 }
-                courseParams = merged
+                mergedCourseParams = merged
             }
             
-            handler.post {
+            postForCurrentServiceRequest(requestContext) {
+                mergedCourseParams?.let { courseParams = it }
                 broadcastLog("✅ 参数就绪 (共 ${courseParams?.size ?: 0} 个)，开始轮询...")
                 startFuzzyMatchPolling()
             }
@@ -3176,15 +3632,22 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
         
         // 构建详情请求参数
         val postBody = buildFuzzyMatchDetailsBody(targetCourseId)
+        val isFirstPoll = fuzzyMatchPollingCount == 1
         
-        CourseApiClient.getInstance().fetchCourseSelectionDetails(school, postBody, serviceAccountStorageKey, object : Callback {
+        val requestContext = serviceRequestContext(school)
+        CourseApiClient.getInstance().fetchCourseSelectionDetails(school, postBody, requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                if (!isCurrentServiceRequest(requestContext)) return
                 Log.e(TAG, "模糊匹配获取详情失败: ${e.message}")
                 // 失败后继续轮询
-                handler.postDelayed({ startFuzzyMatchPolling() }, interval.toLong())
+                postForCurrentServiceRequest(requestContext, interval.toLong()) { startFuzzyMatchPolling() }
             }
             
             override fun onResponse(call: Call, response: Response) {
+                if (!isCurrentServiceRequest(requestContext)) {
+                    response.close()
+                    return
+                }
                 val body = response.body?.string() ?: ""
                 
                 // 🔧 调试日志：输出响应内容（前100字符）
@@ -3193,77 +3656,88 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
                 // 🔧 检查是否返回 "0"（课程不可查询）
                 if (body.trim() == "0" || body.trim() == "null") {
                     Log.w(TAG, "模糊匹配: 服务器返回 '$body'，课程可能不在当前选课批次内")
-                    broadcastLog("⚠️ 无法获取课程详情，可能不在当前选课批次")
-                    // 继续轮询，但间隔稍长
-                    handler.postDelayed({ startFuzzyMatchPolling() }, interval.toLong() * 2)
+                    postForCurrentServiceRequest(requestContext, interval.toLong() * 2) {
+                        // An old response must not publish a user-visible
+                        // state change or schedule work for a replacement run.
+                        broadcastLog("⚠️ 无法获取课程详情，可能不在当前选课批次")
+                        startFuzzyMatchPolling()
+                    }
                     return
                 }
                 
                 try {
                     val classes = JSONArray(body)
-                    
-                    // 🔧 如果是第一次，输出日志
-                    if (fuzzyMatchPollingCount == 1) {
-                        broadcastLog("📋 发现 ${classes.length()} 个教学班")
-                    }
-                    
-                    val vacancyCourses = mutableListOf<Course>()
-                    
+                    val classSnapshots = mutableListOf<FuzzyClassSnapshot>()
                     for (i in 0 until classes.length()) {
                         val item = classes.getJSONObject(i)
                         val classId = item.optString("jxb_id", "")
-                        val doJxbId = item.optString("do_jxb_id", "")
-                        val currentSelected = item.optInt("yxzrs", 0)
-                        val capacity = item.optInt("jxbrl", 0)
-                        val teacher = item.optString("jsxm", "")
-                        val time = item.optString("sksj", "")
-                        
                         if (classId.isEmpty()) continue
-                        
-                        // 检查人数变化
-                        val hasVacancy = updateServiceFuzzySnapshotAndCheckChange(
-                            classId,
-                            currentSelected,
-                            capacity
+                        classSnapshots += FuzzyClassSnapshot(
+                            classId = classId,
+                            doJxbId = item.optString("do_jxb_id", ""),
+                            currentSelected = item.optInt("yxzrs", 0),
+                            capacity = item.optInt("jxbrl", 0),
+                            teacher = item.optString("jsxm", ""),
+                            time = item.optString("sksj", "")
                         )
-                        
-                        if (hasVacancy) {
-                            val vacancyCourse = Course().apply {
+                    }
+
+                    postForCurrentServiceRequest(requestContext) {
+                        if (isFirstPoll) {
+                            broadcastLog("📋 发现 ${classSnapshots.size} 个教学班")
+                        }
+
+                        val vacancyCourses = mutableListOf<Course>()
+                        classSnapshots.forEach { snapshot ->
+                            if (!updateServiceFuzzySnapshotAndCheckChange(
+                                    snapshot.classId,
+                                    snapshot.currentSelected,
+                                    snapshot.capacity
+                                )
+                            ) {
+                                return@forEach
+                            }
+
+                            vacancyCourses += Course().apply {
                                 name = targetCourseName
                                 courseId = targetCourseId
-                                this.classId = classId
-                                this.doJxbId = doJxbId
-                                this.teacher = teacher
-                                this.time = time
-                                this.capacity = capacity
-                                this.selected = currentSelected
+                                classId = snapshot.classId
+                                doJxbId = snapshot.doJxbId
+                                teacher = snapshot.teacher
+                                time = snapshot.time
+                                capacity = snapshot.capacity
+                                selected = snapshot.currentSelected
                                 useExactMatch = true
                             }
-                            vacancyCourses.add(vacancyCourse)
-                            
-                            broadcastLog("检测到 $targetCourseName [$teacher] 有人退课")
-                            broadcastLog("人数变化，剩余 ${capacity - currentSelected} 个名额，立即抢课")
+                            broadcastLog("检测到 $targetCourseName [${snapshot.teacher}] 有人退课")
+                            broadcastLog("人数变化，剩余 ${snapshot.capacity - snapshot.currentSelected} 个名额，立即抢课")
                         }
-                    }
-                    
-                    if (vacancyCourses.isNotEmpty()) {
-                        isFuzzyMatchMode = false // 暂停轮询
-                        if (isParallelMode && vacancyCourses.size > 1) {
-                            startParallelCourseTasks(vacancyCourses, origin = "fuzzy", label = "模糊候选抢课")
+
+                        if (vacancyCourses.isNotEmpty()) {
+                            isFuzzyMatchMode = false // 暂停轮询
+                            if (isParallelMode && vacancyCourses.size > 1) {
+                                startParallelCourseTasks(vacancyCourses, origin = "fuzzy", label = "模糊候选抢课")
+                            } else {
+                                val vacancyCourse = vacancyCourses.first()
+                                targetCourse = vacancyCourse
+                                executeFuzzyMatchSelection(school, vacancyCourse)
+                            }
                         } else {
-                            val vacancyCourse = vacancyCourses.first()
-                            targetCourse = vacancyCourse
-                            executeFuzzyMatchSelection(school, vacancyCourse)
+                            // Re-capture the current request context only by
+                            // continuing inside this still-validated callback.
+                            // The delayed post keeps the original context.
+                            postForCurrentServiceRequest(requestContext, interval.toLong()) {
+                                startFuzzyMatchPolling()
+                            }
                         }
-                    } else {
-                        // 继续轮询
-                        handler.postDelayed({ startFuzzyMatchPolling() }, interval.toLong())
                     }
                     
                 } catch (e: Exception) {
                     Log.e(TAG, "模糊匹配解析失败: ${e.message}")
                     // 继续轮询
-                    handler.postDelayed({ startFuzzyMatchPolling() }, interval.toLong())
+                    postForCurrentServiceRequest(requestContext, interval.toLong()) {
+                        startFuzzyMatchPolling()
+                    }
                 }
             }
         })
@@ -3362,13 +3836,16 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
      */
     private fun executeDirectSelection(school: SchoolConfig, course: Course) {
         if (!isRunning) return
+        val requestContext = serviceRequestContext(school)
         
         retryCount++
         if (retryCount > 10) { // 模糊匹配抢课最多尝试10次
             broadcastLog("⚠️ 抢课失败次数过多，恢复监控")
             isFuzzyMatchMode = true
             // 🔧 恢复监控时重新获取隐藏参数
-            handler.postDelayed({ fetchHiddenParamsAndStartFuzzyMatch(school) }, interval.toLong())
+            postForCurrentServiceRequest(requestContext, interval.toLong()) {
+                fetchHiddenParamsAndStartFuzzyMatch(school)
+            }
             return
         }
         
@@ -3393,14 +3870,21 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
         postBody.append("&xxkbj=0")
         postBody.append("&qz=0")
         
-        CourseApiClient.getInstance().selectCourse(school, postBody.toString(), serviceAccountStorageKey, object : Callback {
+        CourseApiClient.getInstance().selectCourse(school, postBody.toString(), requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                if (!isCurrentServiceRequest(requestContext)) return
                 failCount++
                 broadcastLog("⚠️ 请求失败: ${e.message} [$retryCount/10]")
-                handler.postDelayed({ executeDirectSelection(school, course) }, 500)
+                postForCurrentServiceRequest(requestContext, 500) {
+                    executeDirectSelection(school, course)
+                }
             }
             
             override fun onResponse(call: Call, response: Response) {
+                if (!isCurrentServiceRequest(requestContext)) {
+                    response.close()
+                    return
+                }
                 val html = response.body?.string() ?: ""
                 
                 try {
@@ -3428,22 +3912,27 @@ private fun broadcastQueueUpdate(courseName: String? = null, status: String? = n
                     }
                     
                     if (success) {
-                        successCount++
-                        broadcastLog("🎉 模糊匹配抢课成功: ${course.name}")
-                        updateNotification("抢课成功: ${course.name}")
-                        
-                        // 清除模糊匹配目标，停止服务
-                        clearServiceFuzzyMatchTarget()
-                        stopGrabbing()
+                        postForCurrentServiceRequest(requestContext) {
+                            successCount++
+                            broadcastLog("🎉 模糊匹配抢课成功: ${course.name}")
+                            updateNotification("抢课成功: ${course.name}")
+                            // 清除模糊匹配目标，停止服务
+                            clearServiceFuzzyMatchTarget()
+                            stopGrabbing()
+                        }
                     } else {
                         failCount++
                         broadcastLog("❌ $msg [$retryCount/10]")
-                        handler.postDelayed({ executeDirectSelection(school, course) }, 500)
+                        postForCurrentServiceRequest(requestContext, 500) {
+                            executeDirectSelection(school, course)
+                        }
                     }
                 } catch (e: Exception) {
                     failCount++
                     Log.e(TAG, "解析选课响应失败: ${e.message}")
-                    handler.postDelayed({ executeDirectSelection(school, course) }, 500)
+                    postForCurrentServiceRequest(requestContext, 500) {
+                        executeDirectSelection(school, course)
+                    }
                 }
             }
         })

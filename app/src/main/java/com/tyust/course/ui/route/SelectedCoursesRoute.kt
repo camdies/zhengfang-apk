@@ -7,6 +7,10 @@ import com.tyust.course.manager.CourseCacheManager
 import com.tyust.course.manager.UserManager
 import com.tyust.course.model.Course
 import com.tyust.course.network.CourseApiClient
+import com.tyust.course.session.ScnuProtocolCapabilities
+import com.tyust.course.session.SessionRequestContext
+import com.tyust.course.session.SessionRequestOwner
+import com.tyust.course.session.SessionRequestPurpose
 import com.tyust.course.ui.screen.SelectedCoursesScreen
 import com.tyust.course.utils.CourseParser
 import kotlinx.coroutines.Dispatchers
@@ -16,6 +20,17 @@ import kotlinx.coroutines.withContext
 @Composable
 fun SelectedCoursesRoute() {
     val context = LocalContext.current
+    val selectedSchool = UserManager.getInstance().currentSchool
+    if (!ScnuProtocolCapabilities.isCourseSelectionAllowed(selectedSchool)) {
+        LaunchedEffect(selectedSchool) {
+            Toast.makeText(
+                context,
+                ScnuProtocolCapabilities.unavailableMessage(),
+                Toast.LENGTH_LONG
+            ).show()
+        }
+        return
+    }
     val scope = rememberCoroutineScope()
     
     var courses by remember { mutableStateOf<List<Course>>(emptyList()) }
@@ -26,26 +41,28 @@ fun SelectedCoursesRoute() {
     var xkxnm by remember { mutableStateOf("") }
     var xkxqm by remember { mutableStateOf("") }
 
-    fun isCurrentAccount(accountKey: String): Boolean {
-        return UserManager.getInstance().currentAccountStorageKey == accountKey
-    }
+    fun isCurrentRequest(requestContext: SessionRequestContext): Boolean =
+        requestContext.isSnapshotCurrent()
 
     fun loadSelectedCourses() {
         val userManager = UserManager.getInstance()
         val school = userManager.currentSchool ?: return
         val requestAccountKey = userManager.currentAccountStorageKey
+        val requestContext = SessionRequestContext.forSchool(
+            school, requestAccountKey, SessionRequestPurpose.ACADEMIC_QUERY, SessionRequestOwner.UI
+        )
         isLoading = true
         
         scope.launch(Dispatchers.IO) {
             try {
                 // 1. 动态获取已选课程需要的参数（从选课首页提取）
                 val paramsBody = withContext(Dispatchers.IO) {
-                    val response = CourseApiClient.getInstance().fetchPageHiddenParamsSync(school)
+                    val response = CourseApiClient.getInstance().fetchPageHiddenParamsSync(school, requestContext)
                     if (response != null) {
                         val paramsMap = CourseParser.parseCourseParams(response)
                         // 缓存学年学期参数供退课使用
                         withContext(Dispatchers.Main) {
-                            if (isCurrentAccount(requestAccountKey)) {
+                            if (isCurrentRequest(requestContext)) {
                                 xkxnm = paramsMap["xkxnm"] ?: ""
                                 xkxqm = paramsMap["xkxqm"] ?: ""
                             }
@@ -66,27 +83,29 @@ fun SelectedCoursesRoute() {
                 android.util.Log.d("SelectedCoursesRoute", "发送已选课程请求参数: $paramsBody")
 
                 // 2. 使用提取到的参数获取已选课程
-                val response = CourseApiClient.getInstance().fetchSelectedCoursesSync(school, paramsBody)
+                val response = CourseApiClient.getInstance().fetchSelectedCoursesSync(
+                    school, paramsBody, requestContext
+                )
                 
                 if (response != null) {
                     // 3. 解析课程列表
                     val parsedCourses = CourseParser.parseCourseListFromJson(response)
                     
                     withContext(Dispatchers.Main) {
-                        if (!isCurrentAccount(requestAccountKey)) return@withContext
+                        if (!isCurrentRequest(requestContext)) return@withContext
                         courses = parsedCourses
                         isLoading = false
                     }
                 } else {
                     withContext(Dispatchers.Main) {
-                        if (!isCurrentAccount(requestAccountKey)) return@withContext
+                        if (!isCurrentRequest(requestContext)) return@withContext
                         isLoading = false
                         Toast.makeText(context, "未获取到已选课程数据", Toast.LENGTH_SHORT).show()
                     }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    if (!isCurrentAccount(requestAccountKey)) return@withContext
+                    if (!isCurrentRequest(requestContext)) return@withContext
                     isLoading = false
                     Toast.makeText(context, "加载失败: ${e.message}", Toast.LENGTH_SHORT).show()
                 }
@@ -99,6 +118,9 @@ fun SelectedCoursesRoute() {
         val userManager = UserManager.getInstance()
         val school = userManager.currentSchool ?: return
         val requestAccountKey = userManager.currentAccountStorageKey
+        val requestContext = SessionRequestContext.forSchool(
+            school, requestAccountKey, SessionRequestPurpose.ACADEMIC_QUERY, SessionRequestOwner.UI
+        )
         val requestXkxnm = xkxnm
         val requestXkxqm = xkxqm
         val kchId = course.courseId ?: return
@@ -112,9 +134,11 @@ fun SelectedCoursesRoute() {
         isDropping = true
         scope.launch(Dispatchers.IO) {
             try {
-                val result = CourseApiClient.getInstance().dropCourseSync(school, kchId, jxbIds, requestXkxnm, requestXkxqm)
+                val result = CourseApiClient.getInstance().dropCourseSync(
+                    school, kchId, jxbIds, requestXkxnm, requestXkxqm, requestContext
+                )
                 withContext(Dispatchers.Main) {
-                    if (!isCurrentAccount(requestAccountKey)) return@withContext
+                    if (!isCurrentRequest(requestContext)) return@withContext
                     isDropping = false
                     // 服务器返回 "1" 或 {"flag":"1"} 都表示成功
                     if (result != null && (result.trim() == "\"1\"" || result.contains("\"flag\":\"1\""))) {
@@ -139,7 +163,7 @@ fun SelectedCoursesRoute() {
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    if (!isCurrentAccount(requestAccountKey)) return@withContext
+                    if (!isCurrentRequest(requestContext)) return@withContext
                     isDropping = false
                     Toast.makeText(context, "退课异常: ${e.message}", Toast.LENGTH_SHORT).show()
                 }

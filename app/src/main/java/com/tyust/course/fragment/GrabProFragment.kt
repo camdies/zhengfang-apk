@@ -22,6 +22,10 @@ import com.tyust.course.manager.SmartSelector
 import com.tyust.course.manager.UserManager
 import com.tyust.course.model.Course
 import com.tyust.course.model.SchoolConfig
+import com.tyust.course.session.CourseSelectionCapability
+import com.tyust.course.session.SessionRequestContext
+import com.tyust.course.session.SessionRequestOwner
+import com.tyust.course.session.SessionRequestPurpose
 import com.tyust.course.service.GrabService
 import com.tyust.course.ui.screen.GrabProScreen
 import com.tyust.course.ui.theme.CourseSelectorTheme
@@ -51,6 +55,10 @@ class GrabProFragment : Fragment(), SmartSelector.OnStatusUpdateListener {
     private var fetchRetryCount = 0
     private val maxFetchRetry = 10 // Max retry attempts
     private val fetchRetryDelay = 3000L // 3 seconds between retries
+    private var activeThreeStepContext: SessionRequestContext? = null
+
+    private fun isThreeStepContextCurrent(requestContext: SessionRequestContext): Boolean =
+        isAdded && activeThreeStepContext === requestContext && requestContext.isSnapshotCurrent()
     
     // UI State
     private var isRunning by mutableStateOf(false)
@@ -187,6 +195,14 @@ class GrabProFragment : Fragment(), SmartSelector.OnStatusUpdateListener {
             }
             return
         }
+        val unsupportedMessage = CourseSelectionCapability.unavailableMessage(school)
+        if (unsupportedMessage != null) {
+            if (isAdded && context != null) {
+                Toast.makeText(context, unsupportedMessage, Toast.LENGTH_LONG).show()
+            }
+            appendLog("⚠️ $unsupportedMessage")
+            return
+        }
 
         // Reset counters
         successCount = 0
@@ -226,6 +242,7 @@ class GrabProFragment : Fragment(), SmartSelector.OnStatusUpdateListener {
     }
 
     private fun stopGrabbing() {
+        activeThreeStepContext = null
         // Stop foreground service
         val serviceIntent = Intent(requireContext(), GrabService::class.java).apply {
             action = GrabService.ACTION_STOP
@@ -273,6 +290,15 @@ class GrabProFragment : Fragment(), SmartSelector.OnStatusUpdateListener {
     }
 
     private fun createScheduledTask() {
+        val school = UserManager.getInstance().currentSchool
+        val unsupportedMessage = CourseSelectionCapability.unavailableMessage(school)
+        if (unsupportedMessage != null) {
+            appendLog("⚠️ $unsupportedMessage")
+            if (isAdded && context != null) {
+                Toast.makeText(context, unsupportedMessage, Toast.LENGTH_LONG).show()
+            }
+            return
+        }
         if (courseKeywords.isBlank()) {
             Toast.makeText(context, "请输入课程关键词", Toast.LENGTH_SHORT).show()
             return
@@ -352,6 +378,14 @@ class GrabProFragment : Fragment(), SmartSelector.OnStatusUpdateListener {
             }
             return
         }
+        val unsupportedMessage = CourseSelectionCapability.unavailableMessage(school)
+        if (unsupportedMessage != null) {
+            appendLog("⚠️ $unsupportedMessage")
+            if (isAdded && context != null) {
+                Toast.makeText(context, unsupportedMessage, Toast.LENGTH_LONG).show()
+            }
+            return
+        }
 
         appendLog("🔍 开始搜索匹配课程...")
         appendLog("📝 关键词: $courseKeywords")
@@ -368,7 +402,14 @@ class GrabProFragment : Fragment(), SmartSelector.OnStatusUpdateListener {
 
         // Reset retry counter and start three-step fetch (like Web version)
         fetchRetryCount = 0
-        startThreeStepFetch(school, keywords)
+        val requestContext = SessionRequestContext.forSchool(
+            school = school,
+            accountStorageKey = UserManager.getInstance().currentAccountStorageKey,
+            purpose = SessionRequestPurpose.ACADEMIC_QUERY,
+            owner = SessionRequestOwner.UI
+        )
+        activeThreeStepContext = requestContext
+        startThreeStepFetch(school, keywords, requestContext)
     }
 
     // ============ 三步获取流程 (与Web版一致) ============
@@ -377,31 +418,44 @@ class GrabProFragment : Fragment(), SmartSelector.OnStatusUpdateListener {
     private var indexParams = mutableMapOf<String, String>()
     private var displayParams = mutableMapOf<String, String>()
 
-    private fun startThreeStepFetch(school: SchoolConfig, keywords: List<String>) {
+    private fun startThreeStepFetch(
+        school: SchoolConfig,
+        keywords: List<String>,
+        requestContext: SessionRequestContext
+    ) {
+        if (!isThreeStepContextCurrent(requestContext)) return
+        val unsupportedMessage = CourseSelectionCapability.unavailableMessage(school)
+        if (unsupportedMessage != null) {
+            appendLog("⚠️ $unsupportedMessage")
+            return
+        }
         fetchRetryCount++
         appendLog("📡 Step 1/3: 获取Index页面参数... (尝试 $fetchRetryCount/$maxFetchRetry)")
         
         // Step 1: Fetch Index page
         com.tyust.course.network.CourseApiClient.getInstance().fetchCourseParams(
             school,
+            requestContext,
             object : okhttp3.Callback {
                 override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
                     handler.post {
+                        if (!isThreeStepContextCurrent(requestContext)) return@post
                         appendLog("⚠️ Step 1 失败: ${e.message}")
-                        retryThreeStepFetch(school, keywords)
+                        retryThreeStepFetch(school, keywords, requestContext)
                     }
                 }
 
                 override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
                     val html = response.body?.string() ?: ""
                     handler.post {
+                        if (!isThreeStepContextCurrent(requestContext)) return@post
                         parseIndexParams(html)
                         if (indexParams.isEmpty()) {
                             appendLog("⚠️ Step 1: 未提取到参数")
-                            retryThreeStepFetch(school, keywords)
+                            retryThreeStepFetch(school, keywords, requestContext)
                         } else {
                             appendLog("✅ Step 1 完成: 提取到 ${indexParams.size} 个参数")
-                            fetchDisplayPage(school, keywords)
+                            fetchDisplayPage(school, keywords, requestContext)
                         }
                     }
                 }
@@ -409,7 +463,12 @@ class GrabProFragment : Fragment(), SmartSelector.OnStatusUpdateListener {
         )
     }
 
-    private fun fetchDisplayPage(school: SchoolConfig, keywords: List<String>) {
+    private fun fetchDisplayPage(
+        school: SchoolConfig,
+        keywords: List<String>,
+        requestContext: SessionRequestContext
+    ) {
+        if (!isThreeStepContextCurrent(requestContext)) return
         appendLog("📡 Step 2/3: 获取Display页面参数...")
         
         // Use tabParamsList if available, otherwise use firstXkkzId
@@ -424,21 +483,26 @@ class GrabProFragment : Fragment(), SmartSelector.OnStatusUpdateListener {
         // Start fetching courses from all categories
         allCourses.clear()
         currentTabIndex = 0
-        fetchNextCategory(school, keywords)
+        fetchNextCategory(school, keywords, requestContext)
     }
     
     private var allCourses = mutableListOf<Course>()
     private var currentTabIndex = 0
 
-    private fun fetchNextCategory(school: SchoolConfig, keywords: List<String>) {
+    private fun fetchNextCategory(
+        school: SchoolConfig,
+        keywords: List<String>,
+        requestContext: SessionRequestContext
+    ) {
+        if (!isThreeStepContextCurrent(requestContext)) return
         if (currentTabIndex >= tabParamsList.size) {
             // All categories fetched
             if (allCourses.isEmpty()) {
                 appendLog("⚠️ 所有类别均无课程，可能选课未开放")
-                retryThreeStepFetch(school, keywords)
+                retryThreeStepFetch(school, keywords, requestContext)
             } else {
                 appendLog("✅ Step 3 完成: 共获取到 ${allCourses.size} 门课程 (${tabParamsList.size}个类别)")
-                matchAndSelectCourse(allCourses, keywords)
+                matchAndSelectCourse(allCourses, keywords, requestContext)
             }
             return
         }
@@ -451,26 +515,35 @@ class GrabProFragment : Fragment(), SmartSelector.OnStatusUpdateListener {
         // First fetch Display page for this category to get sfkxq, xkxskcgskg
         com.tyust.course.network.CourseApiClient.getInstance().fetchCourseDisplayParams(
             school, tab.xkkz_id, tab.kklxdm, tab.njdm_id, tab.zyh_id,
+            requestContext,
             object : okhttp3.Callback {
                 override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
                     handler.post {
+                        if (!isThreeStepContextCurrent(requestContext)) return@post
                         appendLog("  ⚠️ Display失败，尝试继续")
-                        fetchCategoryList(school, keywords, tab)
+                        fetchCategoryList(school, keywords, tab, requestContext)
                     }
                 }
 
                 override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
                     val html = response.body?.string() ?: ""
                     handler.post {
+                        if (!isThreeStepContextCurrent(requestContext)) return@post
                         parseDisplayParams(html)
-                        fetchCategoryList(school, keywords, tab)
+                        fetchCategoryList(school, keywords, tab, requestContext)
                     }
                 }
             }
         )
     }
     
-    private fun fetchCategoryList(school: SchoolConfig, keywords: List<String>, tab: TabParam) {
+    private fun fetchCategoryList(
+        school: SchoolConfig,
+        keywords: List<String>,
+        tab: TabParam,
+        requestContext: SessionRequestContext
+    ) {
+        if (!isThreeStepContextCurrent(requestContext)) return
         // Build complete postBody from merged params
         val mergedParams = mutableMapOf<String, String>()
         mergedParams.putAll(indexParams)
@@ -494,17 +567,20 @@ class GrabProFragment : Fragment(), SmartSelector.OnStatusUpdateListener {
         com.tyust.course.network.CourseApiClient.getInstance().fetchAvailableCourses(
             school, 
             postBody,
+            requestContext,
             object : okhttp3.Callback {
                 override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
                     handler.post {
+                        if (!isThreeStepContextCurrent(requestContext)) return@post
                         appendLog("  ⚠️ 类别获取失败: ${e.message}")
-                        fetchNextCategory(school, keywords)
+                        fetchNextCategory(school, keywords, requestContext)
                     }
                 }
 
                 override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
                     val json = response.body?.string() ?: ""
                     handler.post {
+                        if (!isThreeStepContextCurrent(requestContext)) return@post
                         val courses = parseCourseList(json)
                         if (courses.isNotEmpty()) {
                             // Save display params to each course
@@ -521,7 +597,7 @@ class GrabProFragment : Fragment(), SmartSelector.OnStatusUpdateListener {
                             allCourses.addAll(courses)
                             appendLog("  ✅ 获取到 ${courses.size} 门课程")
                         }
-                        fetchNextCategory(school, keywords)
+                        fetchNextCategory(school, keywords, requestContext)
                     }
                 }
             }
@@ -609,7 +685,12 @@ class GrabProFragment : Fragment(), SmartSelector.OnStatusUpdateListener {
         }
     }
 
-    private fun retryThreeStepFetch(school: SchoolConfig, keywords: List<String>) {
+    private fun retryThreeStepFetch(
+        school: SchoolConfig,
+        keywords: List<String>,
+        requestContext: SessionRequestContext
+    ) {
+        if (!isThreeStepContextCurrent(requestContext)) return
         if (fetchRetryCount >= maxFetchRetry) {
             appendLog("❌ 已达最大重试次数 ($maxFetchRetry)")
             appendLog("💡 尝试使用已选课程...")
@@ -621,8 +702,8 @@ class GrabProFragment : Fragment(), SmartSelector.OnStatusUpdateListener {
         appendLog("⏳ ${delay / 1000}秒后重试...")
         
         handler.postDelayed({
-            if (isAdded) {
-                startThreeStepFetch(school, keywords)
+            if (isThreeStepContextCurrent(requestContext)) {
+                startThreeStepFetch(school, keywords, requestContext)
             }
         }, delay)
     }
@@ -676,7 +757,12 @@ class GrabProFragment : Fragment(), SmartSelector.OnStatusUpdateListener {
         return courses
     }
 
-    private fun matchAndSelectCourse(courses: List<Course>, keywords: List<String>) {
+    private fun matchAndSelectCourse(
+        courses: List<Course>,
+        keywords: List<String>,
+        requestContext: SessionRequestContext
+    ) {
+        if (!isThreeStepContextCurrent(requestContext)) return
         appendLog("🔍 开始匹配课程...")
 
         // Calculate similarity for each course

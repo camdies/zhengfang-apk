@@ -14,7 +14,11 @@ import androidx.compose.ui.platform.ComposeView
 import androidx.fragment.app.Fragment
 import com.tyust.course.manager.ScheduleSettingsManager
 import com.tyust.course.manager.UserManager
+import com.tyust.course.model.SchoolConfig
 import com.tyust.course.network.CourseApiClient
+import com.tyust.course.session.SessionRequestContext
+import com.tyust.course.session.SessionRequestOwner
+import com.tyust.course.session.SessionRequestPurpose
 import com.tyust.course.ui.screen.PeriodTimeUi
 import com.tyust.course.ui.screen.ScheduleCourseUi
 import com.tyust.course.ui.screen.ScheduleScreen
@@ -46,6 +50,30 @@ class ScheduleFragment : Fragment() {
         Color(0xFF26C6DA), // Cyan
         Color(0xFF8D6E63)  // Brown
     )
+
+    /**
+     * A schedule refresh belongs to the account and UI epoch that initiated it.
+     * A later account/session change must make its response a harmless no-op.
+     */
+    private fun newUiRequestContext(school: SchoolConfig): SessionRequestContext =
+        SessionRequestContext.forSchool(
+            school = school,
+            accountStorageKey = UserManager.getInstance().currentAccountStorageKey,
+            purpose = SessionRequestPurpose.ACADEMIC_QUERY,
+            owner = SessionRequestOwner.UI
+        )
+
+    private fun isRequestCurrent(requestContext: SessionRequestContext): Boolean =
+        isAdded && requestContext.isSnapshotCurrent()
+
+    private fun runForRequestContext(
+        requestContext: SessionRequestContext,
+        action: () -> Unit
+    ) {
+        activity?.runOnUiThread {
+            if (isRequestCurrent(requestContext)) action()
+        }
+    }
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -137,6 +165,7 @@ class ScheduleFragment : Fragment() {
             Toast.makeText(context, "请先登录", Toast.LENGTH_SHORT).show()
             return
         }
+        val requestContext = newUiRequestContext(school)
 
         val calendar = Calendar.getInstance()
         val year = calendar.get(Calendar.YEAR)
@@ -146,7 +175,7 @@ class ScheduleFragment : Fragment() {
         val xnm = if (month >= 7) year.toString() else (year - 1).toString()
         val xqm = if (month >= 7 || month <= 0) "3" else "12"
         
-        val accountKey = UserManager.getInstance().currentAccountStorageKey
+        val accountKey = requestContext.normalizedAccountStorageKey
         val cacheKey = "schedule_${accountKey}_${school.id}_${xnm}_${xqm}"
 
         // 如果不是强制刷新，先尝试从缓存加载
@@ -167,9 +196,9 @@ class ScheduleFragment : Fragment() {
 
         val postBody = "xnm=$xnm&xqm=$xqm"
 
-        CourseApiClient.getInstance().fetchSchedule(school, postBody, object : Callback {
+        CourseApiClient.getInstance().fetchSchedule(school, postBody, requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                activity?.runOnUiThread {
+                runForRequestContext(requestContext) {
                     isLoading = false
                     // 如果缓存有数据就不显示错误
                     if (courses.isEmpty()) {
@@ -182,34 +211,9 @@ class ScheduleFragment : Fragment() {
 
             override fun onResponse(call: Call, response: Response) {
                 val json = response.body?.string() ?: ""
-                
-                // 检测 Cookie 是否过期（返回登录页面）
-                val isLoginPage = json.contains("用户登录") ||
-                        json.contains("登 录") ||
-                        json.contains("统一身份认证") ||
-                        json.contains("请先登录") ||
-                        json.contains("<!DOCTYPE html") && json.contains("login")
-                
-                if (isLoginPage) {
-                    // Cookie 已过期，跳转到登录页面
-                    activity?.runOnUiThread {
-                        isLoading = false
-                        Toast.makeText(context, "登录状态已过期，请重新登录", Toast.LENGTH_SHORT).show()
-                        
-                        // 清除登录状态
-                        UserManager.getInstance().clearLoginState()
-                        
-                        // 跳转到登录页面
-                        val intent = android.content.Intent(activity, com.tyust.course.LoginActivity::class.java)
-                        intent.flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK
-                        startActivity(intent)
-                    }
-                    return
-                }
-                
                 val parsedCourses = parseSchedule(json)
                 
-                activity?.runOnUiThread {
+                runForRequestContext(requestContext) {
                     isLoading = false
                     if (parsedCourses.isNotEmpty()) {
                         // 保存到缓存

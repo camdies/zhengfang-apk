@@ -117,16 +117,12 @@ class MainActivity : FragmentActivity() {
 
         UserManager.getInstance().init(this)
 
-        val userManager = UserManager.getInstance()
-        if (userManager.hasSavedCookie() && userManager.currentSchool != null) {
-            com.tyust.course.network.CourseApiClient.getInstance().setCookie(
-                userManager.currentSchool.baseUrl,
-                userManager.savedCookie
-            )
-        }
-
         SmartSelector.getInstance().init(this)
         com.tyust.course.network.CourseApiClient.getInstance().init(this)
+        // UserManager restores the typed artifact for the active account.  Do
+        // not reconstruct a flat Cookie header here: that would bypass RFC
+        // host/path matching and is invalid for canonical SCNU sessions.
+        UserManager.getInstance().refreshRuntimeForCurrentAccount()
 
         if (!UserManager.getInstance().isLoggedIn) {
             startActivity(Intent(this, LoginActivity::class.java))
@@ -222,13 +218,22 @@ fun MainScreen(fragmentActivity: FragmentActivity) {
         updateState.checkForUpdate()
     }
 
-    DisposableEffect(fragmentActivity) {
+    DisposableEffect(fragmentActivity, currentAccountStorageKey) {
         val receiver = object : android.content.BroadcastReceiver() {
             override fun onReceive(context: android.content.Context?, intent: android.content.Intent?) {
                 if (intent?.action == com.tyust.course.network.CourseApiClient.ACTION_COOKIE_EXPIRED) {
                     val eventAccountKey = intent.getStringExtra(com.tyust.course.network.CourseApiClient.EXTRA_ACCOUNT_STORAGE_KEY).orEmpty()
                     val currentAccountKey = UserManager.getInstance().currentAccountStorageKey
                     if (eventAccountKey.isNotEmpty() && eventAccountKey != currentAccountKey) return
+                    val eventGeneration = intent.getLongExtra(
+                        com.tyust.course.network.CourseApiClient.EXTRA_SESSION_GENERATION,
+                        Long.MIN_VALUE
+                    )
+                    val snapshot = com.tyust.course.session.SessionRegistry.snapshot(currentAccountKey)
+                    if (eventGeneration == Long.MIN_VALUE ||
+                        snapshot.generation != eventGeneration ||
+                        snapshot.state != com.tyust.course.session.SessionState.EXPIRED
+                    ) return
                     // 幂等闸门：已在提醒态就不重复弹，避免多次 401 连环触发。
                     // Toast 由过期处理链自带（GradesRoute.handleExpiredCookie），此处只驱动 Banner。
                     isTokenExpired = true

@@ -13,6 +13,12 @@ import com.tyust.course.manager.UserManager
 import com.tyust.course.model.Course
 import com.tyust.course.model.SchoolConfig
 import com.tyust.course.network.CourseApiClient
+import com.tyust.course.session.ScnuProtocolCapabilities
+import com.tyust.course.session.SchoolSessionScope
+import com.tyust.course.session.SessionRequestContext
+import com.tyust.course.session.SessionRequestOwner
+import com.tyust.course.session.SessionRequestPurpose
+import com.tyust.course.session.SessionRegistry
 import com.tyust.course.ui.screen.CourseListScreen
 import com.tyust.course.ui.route.SelectedCoursesRoute
 import com.tyust.course.utils.CourseParser
@@ -50,6 +56,31 @@ private data class CourseTabParam(
     val njdmId: String,
     val zyhId: String
 )
+
+/** Captures the foreground identity once for one CourseList UI operation. */
+private fun captureCourseListUiContext(
+    school: SchoolConfig,
+    accountStorageKey: String
+): SessionRequestContext = SessionRequestContext.forSchool(
+    school = school,
+    accountStorageKey = accountStorageKey,
+    purpose = SessionRequestPurpose.ACADEMIC_QUERY,
+    owner = SessionRequestOwner.UI,
+    activeContextEpoch = SessionRegistry.activeContextEpoch()
+)
+
+/**
+ * A UI continuation must still belong to the visible school/account as well
+ * as the immutable registry generation and captured foreground epoch.
+ */
+private fun isCurrentCourseListUiContext(requestContext: SessionRequestContext): Boolean {
+    if (!requestContext.isSnapshotCurrent()) return false
+    val manager = UserManager.getInstance()
+    val school = manager.currentSchool ?: return false
+    return SchoolSessionScope.fromSchool(school) == requestContext.schoolScope &&
+        SessionRegistry.normalizeAccountKey(manager.currentAccountStorageKey) ==
+        requestContext.normalizedAccountStorageKey
+}
 
 private fun parseCourseTabParamsFromIndexHtml(html: String, indexParams: Map<String, String>): List<CourseTabParam> {
     val tabs = mutableListOf<CourseTabParam>()
@@ -114,9 +145,11 @@ private fun runtimeFilterSources(indexParams: Map<String, String>): List<Runtime
 
 private fun loadFilterCategoriesFromRuntimeSource(
     school: SchoolConfig,
+    requestContext: SessionRequestContext,
     indexHtml: String,
     parsedFromHtml: List<CourseParser.FilterCategory> = CourseParser.parseFilterOptions(indexHtml)
 ): List<CourseParser.FilterCategory> {
+    if (!isCurrentCourseListUiContext(requestContext)) return emptyList()
     if (parsedFromHtml.isNotEmpty()) return parsedFromHtml
 
     val indexParams = parseInputParamsFromHtml(indexHtml)
@@ -124,8 +157,10 @@ private fun loadFilterCategoriesFromRuntimeSource(
     val api = CourseApiClient.getInstance()
 
     runtimeFilterSources(indexParams).forEach { source ->
+        if (!isCurrentCourseListUiContext(requestContext)) return categories
         if (indexParams[source.switchName] != "1") return@forEach
-        val json = api.fetchCourseFilterDataSync(school, source.url)
+        val json = api.fetchCourseFilterDataSync(school, source.url, requestContext)
+        if (!isCurrentCourseListUiContext(requestContext)) return categories
         if (json.isNullOrBlank() || json.trimStart().startsWith("<")) {
             android.util.Log.w("CourseListRoute", "筛选项接口无有效 JSON: ${source.paramName}")
             return@forEach
@@ -170,6 +205,28 @@ private fun loadFilterCategoriesFromRuntimeSource(
 @Composable
 fun CourseListRoute() {
     val context = LocalContext.current
+    val selectedSchool = UserManager.getInstance().currentSchool
+    if (!ScnuProtocolCapabilities.isCourseSelectionAllowed(selectedSchool)) {
+        LaunchedEffect(selectedSchool) {
+            Toast.makeText(
+                context,
+                ScnuProtocolCapabilities.unavailableMessage(),
+                Toast.LENGTH_LONG
+            ).show()
+        }
+        Surface(modifier = Modifier.fillMaxSize()) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(24.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = ScnuProtocolCapabilities.unavailableMessage(),
+                    style = MaterialTheme.typography.bodyLarge
+                )
+            }
+        }
+        return
+    }
     val scope = rememberCoroutineScope()
     
     // Data State
@@ -240,9 +297,18 @@ fun CourseListRoute() {
         return UserManager.getInstance().currentAccountStorageKey == accountKey
     }
 
+    fun isCurrentRequestContext(requestContext: SessionRequestContext): Boolean =
+        isCurrentCourseListUiContext(requestContext)
+
     fun runOnUiThreadForAccount(accountKey: String, action: () -> Unit) {
         runOnUiThread {
             if (isCurrentAccount(accountKey)) action()
+        }
+    }
+
+    fun runOnUiThreadForContext(requestContext: SessionRequestContext, action: () -> Unit) {
+        runOnUiThread {
+            if (isCurrentRequestContext(requestContext)) action()
         }
     }
 
@@ -252,24 +318,29 @@ fun CourseListRoute() {
         val school = userManager.currentSchool
         val requestAccountKey = userManager.currentAccountStorageKey
         if (school != null) {
+            val requestContext = captureCourseListUiContext(school, requestAccountKey)
             isLoading = true
             isFilterOptionsLoading = true
             filterOptionsMessage = "正在加载筛选条件..."
-            CourseApiClient.getInstance().fetchCourseParams(school, object : Callback {
+            CourseApiClient.getInstance().fetchCourseParams(school, requestContext, object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    runOnUiThreadForAccount(requestAccountKey) {
+                    runOnUiThreadForContext(requestContext) {
                         isFilterOptionsLoading = false
                         filterOptionsMessage = "筛选条件加载失败，请下拉刷新重试"
                     }
                 }
                 override fun onResponse(call: Call, response: Response) {
+                    if (!isCurrentRequestContext(requestContext)) return
                     val html = response.body?.string() ?: ""
                     scope.launch(Dispatchers.IO) {
+                        if (!isCurrentRequestContext(requestContext)) return@launch
                         val params = CourseParser.parseCourseParams(html)
                         val tabs = parseCourseTabParamsFromIndexHtml(html, params)
                         val parsedFromHtml = CourseParser.parseFilterOptions(html)
-                        val categories = loadFilterCategoriesFromRuntimeSource(school, html, parsedFromHtml)
-                        runOnUiThreadForAccount(requestAccountKey) {
+                        val categories = loadFilterCategoriesFromRuntimeSource(
+                            school, requestContext, html, parsedFromHtml
+                        )
+                        runOnUiThreadForContext(requestContext) {
                             courseParams = params
                             courseTabs = tabs
                             filterCategories = categories
@@ -287,6 +358,7 @@ fun CourseListRoute() {
         val userManager = UserManager.getInstance()
         val school = userManager.currentSchool ?: return
         val requestAccountKey = userManager.currentAccountStorageKey
+        val requestContext = captureCourseListUiContext(school, requestAccountKey)
         
         // 如果不是强制刷新，先检查缓存
         if (!forceRefresh) {
@@ -306,14 +378,16 @@ fun CourseListRoute() {
                 val tmpSchool = school
                 scope.launch(Dispatchers.IO) {
                     // Step 1: 获取 Index 页面参数
-                    CourseApiClient.getInstance().fetchCourseParams(tmpSchool, object : Callback {
+                    if (!isCurrentRequestContext(requestContext)) return@launch
+                    CourseApiClient.getInstance().fetchCourseParams(tmpSchool, requestContext, object : Callback {
                         override fun onFailure(call: Call, e: IOException) {
-                            runOnUiThreadForAccount(requestAccountKey) {
+                            runOnUiThreadForContext(requestContext) {
                                 isFilterOptionsLoading = false
                                 filterOptionsMessage = "筛选条件加载失败，请下拉刷新重试"
                             }
                         }
                         override fun onResponse(call: Call, response: Response) {
+                            if (!isCurrentRequestContext(requestContext)) return
                             val html = response.body?.string() ?: ""
                             val indexParams = mutableMapOf<String, String>()
                             val pattern = """<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>""".toRegex()
@@ -326,8 +400,11 @@ fun CourseListRoute() {
                             val zyh_id = indexParams["zyh_id"] ?: ""
                             
                             val parsedFromHtml = CourseParser.parseFilterOptions(html)
-                            val categories = loadFilterCategoriesFromRuntimeSource(tmpSchool, html, parsedFromHtml)
-                            runOnUiThreadForAccount(requestAccountKey) {
+                            val categories = loadFilterCategoriesFromRuntimeSource(
+                                tmpSchool, requestContext, html, parsedFromHtml
+                            )
+                            if (!isCurrentRequestContext(requestContext)) return
+                            runOnUiThreadForContext(requestContext) {
                                 courseParams = indexParams
                                 courseTabs = parsedTabs
                                 filterCategories = categories
@@ -338,15 +415,16 @@ fun CourseListRoute() {
                             if (xkkz_id.isNotEmpty()) {
                                 // Step 2: 获取 Display 页面参数
                                 CourseApiClient.getInstance().fetchCourseDisplayParams(
-                                    tmpSchool, xkkz_id, kklxdm, njdm_id, zyh_id,
+                                    tmpSchool, xkkz_id, kklxdm, njdm_id, zyh_id, requestContext,
                                     object : Callback {
                                         override fun onFailure(call: Call, e: IOException) {}
                                         override fun onResponse(call: Call, response: Response) {
+                                            if (!isCurrentRequestContext(requestContext)) return
                                             val displayHtml = response.body?.string() ?: ""
                                             val newDisplayParams = mutableMapOf<String, String>()
                                             pattern.findAll(displayHtml).forEach { m -> newDisplayParams[m.groupValues[1]] = m.groupValues[2] }
                                             android.util.Log.d("CourseListRoute", "✅ 后台获取 Display 参数: bklx_id=${newDisplayParams["bklx_id"]}, jg_id=${newDisplayParams["jg_id"]}")
-                                            runOnUiThreadForAccount(requestAccountKey) {displayParams = newDisplayParams }
+                                            runOnUiThreadForContext(requestContext) { displayParams = newDisplayParams }
                                         }
                                     }
                                 )
@@ -367,9 +445,9 @@ fun CourseListRoute() {
             Toast.makeText(context, "正在刷新课程列表...", Toast.LENGTH_SHORT).show()
         }
 
-        CourseApiClient.getInstance().fetchCourseParams(school, object : Callback {
+        CourseApiClient.getInstance().fetchCourseParams(school, requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                runOnUiThreadForAccount(requestAccountKey) {
+                runOnUiThreadForContext(requestContext) {
                     isLoading = false
                     isFilterOptionsLoading = false
                     filterOptionsMessage = "筛选条件加载失败，请下拉刷新重试"
@@ -378,20 +456,23 @@ fun CourseListRoute() {
             }
 
             override fun onResponse(call: Call, response: Response) {
+                if (!isCurrentRequestContext(requestContext)) return
                 val html = response.body?.string() ?: ""
                 scope.launch(Dispatchers.IO) {
-                    val categories = loadFilterCategoriesFromRuntimeSource(school, html)
-                    runOnUiThreadForAccount(requestAccountKey) {
+                    if (!isCurrentRequestContext(requestContext)) return@launch
+                    val categories = loadFilterCategoriesFromRuntimeSource(school, requestContext, html)
+                    if (!isCurrentRequestContext(requestContext)) return@launch
+                    runOnUiThreadForContext(requestContext) {
                         filterCategories = categories
                         isFilterOptionsLoading = false
                         filterOptionsMessage = if (categories.isEmpty()) "筛选条件加载失败，请下拉刷新重试" else ""
                     }
-                    val helper = CourseListLogicHelper(context, school, 
+                    val helper = CourseListLogicHelper(context, school, requestContext,
                         onSuccess = onSuccess@ { newCourses ->
-                            if (!isCurrentAccount(requestAccountKey)) return@onSuccess
+                            if (!isCurrentRequestContext(requestContext)) return@onSuccess
                             // 保存到缓存
                             CourseCacheManager.saveCourses(context, newCourses, requestAccountKey)
-                            runOnUiThreadForAccount(requestAccountKey) {
+                            runOnUiThreadForContext(requestContext) {
                                 allCourses = newCourses
                                 courses = newCourses
                                 isLoading = false
@@ -401,14 +482,14 @@ fun CourseListRoute() {
                             }
                         },
                         onError = { msg ->
-                            runOnUiThreadForAccount(requestAccountKey) {
+                            runOnUiThreadForContext(requestContext) {
                                 isLoading = false
                                 Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                             }
                         },
                         // 🔧 渐进式加载：每个分类完成后立即更新UI
                         onProgress = { currentCourses, completedTabs, totalTabs ->
-                            runOnUiThreadForAccount(requestAccountKey) {
+                            runOnUiThreadForContext(requestContext) {
                                 allCourses = currentCourses
                                 courses = currentCourses
                                 android.util.Log.d("CourseListRoute", "📊 渐进加载: $completedTabs/$totalTabs 分类完成，已获取 ${currentCourses.size} 门课程")
@@ -416,13 +497,13 @@ fun CourseListRoute() {
                         },
                         // 🔧 新增：接收 displayParams 更新状态
                         onDisplayParams = { params ->
-                            runOnUiThreadForAccount(requestAccountKey) {
+                            runOnUiThreadForContext(requestContext) {
                                 displayParams = params
                                 android.util.Log.d("CourseListRoute", "✅ 更新 displayParams: ${params.size} 个参数, bklx_id=${params["bklx_id"]}")
                             }
                         },
                         onTabParams = { tabs ->
-                            runOnUiThreadForAccount(requestAccountKey) {
+                            runOnUiThreadForContext(requestContext) {
                                 courseTabs = tabs
                                 android.util.Log.d("CourseListRoute", "✅ 更新选课分类入口: ${tabs.size} 个")
                             }
@@ -461,26 +542,31 @@ fun CourseListRoute() {
                 activeFilter = null
                 Toast.makeText(context, "未找到当前学校配置", Toast.LENGTH_SHORT).show()
             } else {
+                val requestContext = captureCourseListUiContext(school, requestAccountKey)
                 val baseIndexParams = mutableMapOf<String, String>()
                 courseParams?.let { baseIndexParams.putAll(it) }
+                val displayParamsSnapshot = displayParams.toMap()
                 val tabs = courseTabs.ifEmpty {
                     parseCourseTabParamsFromIndexHtml("", baseIndexParams)
                 }
                 val filterParams = filter.toPostParams()
 
                 scope.launch(Dispatchers.IO) {
+                    if (!isCurrentCourseListUiContext(requestContext)) return@launch
                     val filteredCourses = mutableListOf<Course>()
                     var lastError: String? = null
 
                     for (tab in tabs) {
-                        if (!isCurrentAccount(requestAccountKey)) return@launch
+                        if (!isCurrentCourseListUiContext(requestContext)) return@launch
                         val displayHtml = CourseApiClient.getInstance().fetchCourseDisplayParamsSync(
                             school,
                             tab.xkkzId,
                             tab.kklxdm,
                             tab.njdmId,
-                            tab.zyhId
+                            tab.zyhId,
+                            requestContext
                         )
+                        if (!isCurrentCourseListUiContext(requestContext)) return@launch
                         val tabDisplayParams = parseInputParamsFromHtml(displayHtml ?: "")
                         if (displayHtml == null) {
                             lastError = "Display 参数请求失败"
@@ -488,7 +574,7 @@ fun CourseListRoute() {
 
                         val mergedParams = mutableMapOf<String, String>()
                         mergedParams.putAll(baseIndexParams)
-                        mergedParams.putAll(displayParams)
+                        mergedParams.putAll(displayParamsSnapshot)
                         mergedParams.putAll(tabDisplayParams)
                         mergedParams["xkkz_id"] = tab.xkkzId
                         mergedParams["kklxdm"] = tab.kklxdm
@@ -527,6 +613,7 @@ fun CourseListRoute() {
                         var jspage = 10
                         var pageGuard = 0
                         do {
+                            if (!isCurrentCourseListUiContext(requestContext)) return@launch
                             val formData = mutableMapOf<String, String>()
                             val rwlx = mergedParams["rwlx"] ?: "1"
                             val xklc = mergedParams["xklc"] ?: "2"
@@ -560,7 +647,12 @@ fun CourseListRoute() {
 
                             val baseParams = formData.entries.joinToString("&") { "${it.key}=${it.value}" }
                             val postBody = if (filterParams.isEmpty()) baseParams else "$filterParams&$baseParams"
-                            val json = CourseApiClient.getInstance().fetchAvailableCoursesSync(school, postBody)
+                            val json = CourseApiClient.getInstance().fetchAvailableCoursesSync(
+                                school,
+                                postBody,
+                                requestContext
+                            )
+                            if (!isCurrentCourseListUiContext(requestContext)) return@launch
                             if (json == null) {
                                 lastError = "课程筛选请求失败"
                                 break
@@ -588,7 +680,7 @@ fun CourseListRoute() {
                     }
 
                     val uniqueCourses = filteredCourses.distinctBy { "${it.courseId}_${it.classId}_${it.doJxbId}" }
-                    runOnUiThreadForAccount(requestAccountKey) {
+                    runOnUiThreadForContext(requestContext) {
                         isFilterLoading = false
                         courses = uniqueCourses
                         val message = if (uniqueCourses.isNotEmpty()) {
@@ -786,18 +878,19 @@ fun CourseListRoute() {
     // 🔧 后台并行预加载所有课程详情
     suspend fun preloadAllCourseDetails(school: SchoolConfig, courseList: List<Course>) {
         val requestAccountKey = UserManager.getInstance().currentAccountStorageKey
+        val requestContext = captureCourseListUiContext(school, requestAccountKey)
         // 按课程ID分组
         val grouped = courseList.groupBy { it.courseId ?: "" }.filter { it.key.isNotEmpty() }
         val totalGroups = grouped.size
-        if (totalGroups == 0 || !isCurrentAccount(requestAccountKey)) return
+        if (totalGroups == 0 || !isCurrentRequestContext(requestContext)) return
         
         withContext(Dispatchers.Main) {
-            if (!isCurrentAccount(requestAccountKey)) return@withContext
+            if (!isCurrentRequestContext(requestContext)) return@withContext
             isPreloading = true
             preloadProgress = 0f
             preloadedGroupIds = emptySet()
         }
-        if (!isCurrentAccount(requestAccountKey)) return
+        if (!isCurrentRequestContext(requestContext)) return
         
         android.util.Log.d("CourseListRoute", "🚀 开始并行预加载 $totalGroups 个课程组")
         
@@ -810,12 +903,16 @@ fun CourseListRoute() {
             scope.launch(Dispatchers.IO) {
                 semaphore.acquire()
                 try {
-                    if (!isCurrentAccount(requestAccountKey)) return@launch
+                    if (!isCurrentRequestContext(requestContext)) return@launch
                     val firstCourse = classes.firstOrNull() ?: return@launch
                     val postBody = buildDetailsRequestBody(firstCourse)
                     
-                    val response = CourseApiClient.getInstance().fetchCourseSelectionDetailsSync(school, postBody)
-                    if (!isCurrentAccount(requestAccountKey)) return@launch
+                    val response = CourseApiClient.getInstance().fetchCourseSelectionDetailsSync(
+                        school,
+                        postBody,
+                        requestContext
+                    )
+                    if (!isCurrentRequestContext(requestContext)) return@launch
                     if (response != null) {
                         try {
                             val array = JSONArray(response)
@@ -855,7 +952,7 @@ fun CourseListRoute() {
                         val progress = completedCount.toFloat() / totalGroups
                         
                         scope.launch(Dispatchers.Main) updateProgress@ {
-                            if (!isCurrentAccount(requestAccountKey)) return@updateProgress
+                            if (!isCurrentRequestContext(requestContext)) return@updateProgress
                             preloadProgress = progress
                             preloadedGroupIds = preloadedGroupIds + courseId
                             
@@ -873,7 +970,7 @@ fun CourseListRoute() {
         jobs.forEach { it.join() }
         
         withContext(Dispatchers.Main) {
-            if (!isCurrentAccount(requestAccountKey)) return@withContext
+            if (!isCurrentRequestContext(requestContext)) return@withContext
             isPreloading = false
             preloadProgress = 1f
             hasPreloadedOnce = true // 🔧 标记已完成预加载
@@ -897,8 +994,9 @@ fun CourseListRoute() {
             Toast.makeText(context, "未登录，无法获取详情", Toast.LENGTH_SHORT).show()
             onComplete(false)
         } else {
+            val requestContext = captureCourseListUiContext(school, requestAccountKey)
             scope.launch(Dispatchers.IO) {
-                if (!isCurrentAccount(requestAccountKey)) return@launch
+                if (!isCurrentRequestContext(requestContext)) return@launch
                 var success = false
                 try {
                     // 只需要请求一次（所有教学班属于同一个课程）
@@ -907,8 +1005,12 @@ fun CourseListRoute() {
                         val postBody = buildDetailsRequestBody(firstCourse)
                         android.util.Log.d("CourseListRoute", "请求详情, kch_id=${firstCourse.courseId}, 共${classesList.size}个教学班")
                         
-                        val response = CourseApiClient.getInstance().fetchCourseSelectionDetailsSync(school, postBody)
-                        if (!isCurrentAccount(requestAccountKey)) return@launch
+                        val response = CourseApiClient.getInstance().fetchCourseSelectionDetailsSync(
+                            school,
+                            postBody,
+                            requestContext
+                        )
+                        if (!isCurrentRequestContext(requestContext)) return@launch
                         if (response != null && response.isNotEmpty()) {
                             android.util.Log.d("CourseListRoute", "详情响应长度: ${response.length}")
                             
@@ -956,7 +1058,7 @@ fun CourseListRoute() {
                     }
                     
                     withContext(Dispatchers.Main) {
-                        if (!isCurrentAccount(requestAccountKey)) return@withContext
+                        if (!isCurrentRequestContext(requestContext)) return@withContext
                         if (!success) {
                             Toast.makeText(context, "❗获取详情失败，请重新点击展开", Toast.LENGTH_SHORT).show()
                         }
@@ -965,7 +1067,7 @@ fun CourseListRoute() {
                 } catch (e: Exception) {
                     android.util.Log.e("CourseListRoute", "获取详情失败: ${e.message}")
                     withContext(Dispatchers.Main) {
-                        if (!isCurrentAccount(requestAccountKey)) return@withContext
+                        if (!isCurrentRequestContext(requestContext)) return@withContext
                         Toast.makeText(context, "❗网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
                         onComplete(false)
                     }
@@ -980,17 +1082,18 @@ fun CourseListRoute() {
             val userManager = UserManager.getInstance()
             val school = userManager.currentSchool ?: return
             val requestAccountKey = userManager.currentAccountStorageKey
+            val requestContext = captureCourseListUiContext(school, requestAccountKey)
             val paramsSnapshot = courseParams?.toMap()
             Toast.makeText(context, "正在选课: ${course.name}...", Toast.LENGTH_SHORT).show()
             
             // 使用协程异步执行选课，完成后显示结果
             scope.launch(Dispatchers.IO) {
-                if (!isCurrentAccount(requestAccountKey)) return@launch
-                val logic = CourseSelectionLogic(context, school, paramsSnapshot, requestAccountKey)
+                if (!isCurrentRequestContext(requestContext)) return@launch
+                val logic = CourseSelectionLogic(context, school, paramsSnapshot, requestContext)
                 val result = logic.performSelectionSync(course)
                 
                 withContext(Dispatchers.Main) {
-                    if (!isCurrentAccount(requestAccountKey)) return@withContext
+                    if (!isCurrentRequestContext(requestContext)) return@withContext
                     if (result) {
                         Toast.makeText(context, "✅ 选课成功: ${course.name}", Toast.LENGTH_LONG).show()
                         course.isSelected = true
@@ -1012,32 +1115,33 @@ fun CourseListRoute() {
             val userManager = UserManager.getInstance()
             val school = userManager.currentSchool ?: return
             val requestAccountKey = userManager.currentAccountStorageKey
+            val requestContext = captureCourseListUiContext(school, requestAccountKey)
             val paramsSnapshot = courseParams?.toMap()
             isBatchSelecting = true
             Toast.makeText(context, "开始批量抢课，共 ${selectedCourses.size} 门课程", Toast.LENGTH_SHORT).show()
             
             scope.launch(Dispatchers.IO) {
-                if (!isCurrentAccount(requestAccountKey)) return@launch
-                val logic = CourseSelectionLogic(context, school, paramsSnapshot, requestAccountKey)
+                if (!isCurrentRequestContext(requestContext)) return@launch
+                val logic = CourseSelectionLogic(context, school, paramsSnapshot, requestContext)
                 var successCount = 0
                 var failCount = 0
                 
                 selectedCourses.forEachIndexed { index, course ->
-                    if (!isCurrentAccount(requestAccountKey)) return@launch
+                    if (!isCurrentRequestContext(requestContext)) return@launch
                     withContext(Dispatchers.Main) {
-                        if (!isCurrentAccount(requestAccountKey)) return@withContext
+                        if (!isCurrentRequestContext(requestContext)) return@withContext
                         Toast.makeText(context, "正在抢课 (${index + 1}/${selectedCourses.size}): ${course.name}", Toast.LENGTH_SHORT).show()
                     }
                     
                     val result = logic.performSelectionSync(course)
-                    if (!isCurrentAccount(requestAccountKey)) return@launch
+                    if (!isCurrentRequestContext(requestContext)) return@launch
                     if (result) successCount++ else failCount++
                     
                     Thread.sleep(500)
                 }
                 
                 withContext(Dispatchers.Main) {
-                    if (!isCurrentAccount(requestAccountKey)) return@withContext
+                    if (!isCurrentRequestContext(requestContext)) return@withContext
                     isBatchSelecting = false
                     Toast.makeText(context, "批量抢课完成！成功: $successCount 门，失败: $failCount 门", Toast.LENGTH_LONG).show()
                 }
@@ -1308,6 +1412,7 @@ fun CourseListRoute() {
 private class CourseListLogicHelper(
     val context: android.content.Context,
     val school: SchoolConfig,
+    val requestContext: SessionRequestContext,
     val onSuccess: (List<Course>) -> Unit,
     val onError: (String) -> Unit,
     // 🔧 渐进式加载回调：每加载一批就立即回调
@@ -1322,8 +1427,16 @@ private class CourseListLogicHelper(
     private var tabParamsList = mutableListOf<CourseTabParam>()
     private var currentTabIndex = 0
     private var allCourses = mutableListOf<Course>()
+
+    private fun isCurrentRequestContext(): Boolean =
+        isCurrentCourseListUiContext(requestContext)
+
+    private fun reportError(message: String) {
+        if (isCurrentRequestContext()) onError(message)
+    }
     
     fun parseIndexParamsAndFetch(html: String) {
+        if (!isCurrentRequestContext()) return
         // Logic from parseIndexParams
          try {
             val pattern = """<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>""".toRegex()
@@ -1339,16 +1452,18 @@ private class CourseListLogicHelper(
 
             tabParamsList.clear()
             tabParamsList.addAll(parseCourseTabParamsFromIndexHtml(html, indexParams))
+            if (!isCurrentRequestContext()) return
             onTabParams?.invoke(tabParamsList.toList())
             
             fetchDisplayPage()
         } catch (e: Exception) {
-            onError("解析Index失败: ${e.message}")
+            reportError("解析Index失败: ${e.message}")
         }
     }
     
     private fun fetchDisplayPage() {
-         if (tabParamsList.isEmpty()) { onError("未找到选课参数"); return }
+         if (!isCurrentRequestContext()) return
+         if (tabParamsList.isEmpty()) { reportError("未找到选课参数"); return }
          
          currentTabIndex = 0
          allCourses.clear()
@@ -1356,6 +1471,7 @@ private class CourseListLogicHelper(
     }
     
     private fun fetchNextCategory() {
+        if (!isCurrentRequestContext()) return
         if (currentTabIndex >= tabParamsList.size) {
             onSuccess(allCourses)
             return
@@ -1365,13 +1481,15 @@ private class CourseListLogicHelper(
         currentTabIndex++
         
         CourseApiClient.getInstance().fetchCourseDisplayParams(
-            school, tab.xkkzId, tab.kklxdm, tab.njdmId, tab.zyhId,
+            school, tab.xkkzId, tab.kklxdm, tab.njdmId, tab.zyhId, requestContext,
             object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
+                     if (!isCurrentRequestContext()) return
                      // Try fetch list anyway (fallback)
                      fetchCategoryList(tab)
                 }
                 override fun onResponse(call: Call, response: Response) {
+                    if (!isCurrentRequestContext()) return
                     val html = response.body?.string() ?: ""
                     
                     // 检查是否返回了登录页面
@@ -1388,6 +1506,7 @@ private class CourseListLogicHelper(
                     if (displayParams.isNotEmpty()) {
                         android.util.Log.d("CourseListRoute", "   关键参数: rwlx=${displayParams["rwlx"]}, xklc=${displayParams["xklc"]}, bklx_id=${displayParams["bklx_id"]}")
                         // 🔧 回调传递 displayParams 给外部
+                        if (!isCurrentRequestContext()) return
                         onDisplayParams?.invoke(displayParams.toMap())
                     }
                     
@@ -1409,6 +1528,7 @@ private class CourseListLogicHelper(
     private val RETRY_DELAY_MS = 2000L // 重试延迟（毫秒）
     
     private fun fetchCategoryList(tab: CourseTabParam) {
+        if (!isCurrentRequestContext()) return
         currentTab = tab
         
         // 合并参数
@@ -1433,6 +1553,7 @@ private class CourseListLogicHelper(
     
     // 获取分类的单页数据（递归调用实现多页获取）
     private fun fetchCategoryPage() {
+        if (!isCurrentRequestContext()) return
         val tab = currentTab ?: return
         
         // 🔧 关键修复：只发送 Web 版需要的特定参数，而不是全部参数
@@ -1514,8 +1635,9 @@ private class CourseListLogicHelper(
         
         android.util.Log.d("CourseListRoute", "📄 请求页面: kspage=$currentKspage, jspage=$currentJspage")
         
-        CourseApiClient.getInstance().fetchAvailableCourses(school, postBody, object: Callback {
+        CourseApiClient.getInstance().fetchAvailableCourses(school, postBody, requestContext, object: Callback {
             override fun onFailure(call: Call, e: IOException) {
+                if (!isCurrentRequestContext()) return
                 // 🔧 服务器延迟检测：失败时重试
                 if (currentRetryCount < MAX_RETRY_COUNT) {
                     currentRetryCount++
@@ -1523,6 +1645,7 @@ private class CourseListLogicHelper(
                     try {
                         Thread.sleep(RETRY_DELAY_MS)
                     } catch (_: InterruptedException) {}
+                    if (!isCurrentRequestContext()) return
                     fetchCategoryPage() // 重试当前页
                 } else {
                     android.util.Log.e("CourseListRoute", "❌ 重试 $MAX_RETRY_COUNT 次后仍失败，跳过此分类")
@@ -1532,6 +1655,7 @@ private class CourseListLogicHelper(
             }
             
             override fun onResponse(call: Call, response: Response) {
+                if (!isCurrentRequestContext()) return
                 val json = response.body?.string() ?: ""
                 currentRetryCount = 0 // 🔧 成功后重置重试计数器
                 
@@ -1548,6 +1672,7 @@ private class CourseListLogicHelper(
                         android.util.Log.d("CourseListRoute", "✅ 分类 ${tab.kklxdm} 页面 kspage=$currentKspage 没有数据，分类获取完成")
                         
                         // 🔧 渐进式回调：每个分类完成后立即通知UI更新
+                        if (!isCurrentRequestContext()) return
                         onProgress?.invoke(allCourses.toList(), currentTabIndex, tabParamsList.size)
                         
                         fetchNextCategory()
@@ -1564,6 +1689,7 @@ private class CourseListLogicHelper(
                     android.util.Log.d("CourseListRoute", "分类 ${tab.kklxdm} 页面 kspage=$currentKspage 获取到 ${parsed.size} 门课程")
                     
                     // 🔧 每页数据获取后就立即更新UI（不等Tab完成）
+                    if (!isCurrentRequestContext()) return
                     onProgress?.invoke(allCourses.toList(), currentTabIndex, tabParamsList.size)
                     
                     // 🔧 智能分页：根据获取数量动态调整下一页参数
@@ -1590,10 +1716,10 @@ private class CourseSelectionLogic(
     val context: android.content.Context,
     val school: SchoolConfig,
     val baseParams: Map<String, String>?,
-    val accountKey: String? = null
+    private val requestContext: SessionRequestContext
 ) {
     private fun isCurrentAccount(): Boolean {
-        return accountKey == null || UserManager.getInstance().currentAccountStorageKey == accountKey
+        return isCurrentCourseListUiContext(requestContext)
     }
 
     private fun postToCurrentAccount(action: () -> Unit) {
@@ -1695,7 +1821,7 @@ private class CourseSelectionLogic(
         android.util.Log.d("CourseSelectionLogic", "选课详情请求参数数量: ${formData.size}")
         android.util.Log.d("CourseSelectionLogic", "选课参数: xkkz_id=$xkkz_id, kklxdm=$kklxdm")
 
-        CourseApiClient.getInstance().fetchCourseSelectionDetails(school, postBody,
+        CourseApiClient.getInstance().fetchCourseSelectionDetails(school, postBody, requestContext,
             object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
                     postToCurrentAccount {
@@ -1741,7 +1867,7 @@ private class CourseSelectionLogic(
         
         // Step 0: 获取页面隐藏参数 (Web版 getPageHiddenParams)
         android.util.Log.d("CourseSelectionLogic", "Step 0: 获取页面隐藏参数...")
-        val hiddenParamsHtml = CourseApiClient.getInstance().fetchPageHiddenParamsSync(school)
+        val hiddenParamsHtml = CourseApiClient.getInstance().fetchPageHiddenParamsSync(school, requestContext)
         val hiddenParams = parseHiddenParams(hiddenParamsHtml ?: "")
         if (!isCurrentAccount()) return false
         android.util.Log.d("CourseSelectionLogic", "隐藏参数: $hiddenParams")
@@ -1814,7 +1940,7 @@ private class CourseSelectionLogic(
         android.util.Log.d("CourseSelectionLogic", "Step 1: 获取选课详情 (do_jxb_id)...")
         android.util.Log.d("CourseSelectionLogic", "Step 1 参数数量: ${formData.size}")
         val detailsResponse = CourseApiClient.getInstance().fetchCourseSelectionDetailsSync(
-            school, detailsPostBody
+            school, detailsPostBody, requestContext
         )
         if (!isCurrentAccount()) return false
         
@@ -1834,7 +1960,7 @@ private class CourseSelectionLogic(
         // Step 2: 执行选课
         android.util.Log.d("CourseSelectionLogic", "Step 2: 执行选课...")
         val postBody = buildSelectionBodyWithDetails(course, details, kklxdm, rwlx, xklc)
-        val result = CourseApiClient.getInstance().selectCourseSync(school, postBody)
+        val result = CourseApiClient.getInstance().selectCourseSync(school, postBody, requestContext)
         if (!isCurrentAccount()) return false
         
         val success = result != null && (result.contains("\"flag\":\"1\"") || result.contains("成功"))
@@ -1919,7 +2045,11 @@ private class CourseSelectionLogic(
     private fun verifySelection(courseId: String): Boolean {
         try {
             // 获取已选课程列表
-            val selectedCoursesJson = CourseApiClient.getInstance().fetchSelectedCoursesSync(school, "")
+            val selectedCoursesJson = CourseApiClient.getInstance().fetchSelectedCoursesSync(
+                school,
+                "",
+                requestContext
+            )
             if (selectedCoursesJson == null) return false
             
             // 检查课程是否在已选列表中
@@ -2022,7 +2152,7 @@ private class CourseSelectionLogic(
          if (!isCurrentAccount()) return
          val postBody = buildSelectionBodyWithDetails(course, details, kklxdm, rwlx, xklc)
 
-         CourseApiClient.getInstance().selectCourse(school, postBody, object : Callback {
+         CourseApiClient.getInstance().selectCourse(school, postBody, requestContext, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 postToCurrentAccount {
                     Toast.makeText(context, "请求失败: ${e.message}", Toast.LENGTH_SHORT).show()

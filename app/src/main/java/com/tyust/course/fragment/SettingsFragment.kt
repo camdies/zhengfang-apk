@@ -219,7 +219,7 @@ class SettingsFragment : Fragment() {
                 val selected = schools[which]
                 // 切换学校需要重新登录
                 UserManager.getInstance().clearLoginState()
-                UserManager.getInstance().currentSchool = selected
+                UserManager.getInstance().setCurrentSchool(selected)
                 Toast.makeText(context, "已切换到: ${selected.name}，请重新登录", Toast.LENGTH_SHORT).show()
                 
                 // 跳转到登录页面

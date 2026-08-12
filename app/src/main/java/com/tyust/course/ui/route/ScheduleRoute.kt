@@ -42,6 +42,9 @@ import androidx.fragment.app.FragmentActivity
 import com.tyust.course.manager.ScheduleSettingsManager
 import com.tyust.course.manager.UserManager
 import com.tyust.course.network.CourseApiClient
+import com.tyust.course.session.SessionRequestContext
+import com.tyust.course.session.SessionRequestOwner
+import com.tyust.course.session.SessionRequestPurpose
 import com.tyust.course.ui.screen.PeriodTimeUi
 import com.tyust.course.ui.screen.ScheduleCourseUi
 import com.tyust.course.ui.screen.ScheduleScreen
@@ -176,6 +179,12 @@ fun ScheduleRoute() {
         fun(forceRefresh: Boolean) {
             val school = UserManager.getInstance().currentSchool
             if (school == null) return
+
+            if (!com.tyust.course.session.ScnuProtocolCapabilities.isAcademicProfileAvailable(school)) {
+                isLoading = false
+                Toast.makeText(context, com.tyust.course.session.ScnuProtocolCapabilities.unavailableMessage(), Toast.LENGTH_LONG).show()
+                return
+            }
             
             val calendar = Calendar.getInstance()
             val year = calendar.get(Calendar.YEAR)
@@ -193,10 +202,14 @@ fun ScheduleRoute() {
                 }
             }
             
-            val accountKey = UserManager.getInstance().currentAccountStorageKey
-            fun isRequestAccountActive(): Boolean {
-                return UserManager.getInstance().currentAccountStorageKey == accountKey
-            }
+            val requestContext = SessionRequestContext.forSchool(
+                school = school,
+                accountStorageKey = UserManager.getInstance().currentAccountStorageKey,
+                purpose = SessionRequestPurpose.ACADEMIC_QUERY,
+                owner = SessionRequestOwner.UI
+            )
+            fun isRequestCurrent(): Boolean = requestContext.isSnapshotCurrent()
+            val accountKey = requestContext.normalizedAccountStorageKey
             val cacheKey = "schedule_${accountKey}_${school.id}_${xnm}_${xqm}"
 
             if (!forceRefresh) {
@@ -210,39 +223,36 @@ fun ScheduleRoute() {
             }
 
             isLoading = true
-            CourseApiClient.getInstance().fetchSchedule(school, "xnm=$xnm&xqm=$xqm", object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    scope.launch(Dispatchers.Main) {
-                        if (!isRequestAccountActive()) return@launch
-                        isLoading = false
-                        if (courses.isEmpty()) Toast.makeText(context, "加载失败: ${e.message}", Toast.LENGTH_SHORT).show()
+            CourseApiClient.getInstance().fetchSchedule(
+                school,
+                "xnm=$xnm&xqm=$xqm",
+                requestContext,
+                object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        scope.launch(Dispatchers.Main) {
+                            if (!isRequestCurrent()) return@launch
+                            isLoading = false
+                            if (courses.isEmpty()) Toast.makeText(context, "加载失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                        }
                     }
-                }
 
-                override fun onResponse(call: Call, response: Response) {
-                    val json = response.body?.string() ?: ""
-                    if (json.contains("用户登录")) {
-                         scope.launch(Dispatchers.Main) { 
-                             if (!isRequestAccountActive()) return@launch
-                             isLoading = false
-                             Toast.makeText(context, "请先登录", Toast.LENGTH_SHORT).show() 
-                         }
-                        return
-                    }
-                    val parsed = parseSchedule(json)
-                    scope.launch(Dispatchers.Main) {
-                        if (!isRequestAccountActive()) return@launch
-                        isLoading = false
-                        if (parsed.isNotEmpty()) {
-                            saveScheduleToCache(cacheKey, json)
-                            courses = reloadCustomCourses(parsed)
-                            if (forceRefresh) Toast.makeText(context, "已刷新", Toast.LENGTH_SHORT).show()
-                        } else if (courses.isEmpty()) {
-                            Toast.makeText(context, "暂无课程", Toast.LENGTH_SHORT).show()
+                    override fun onResponse(call: Call, response: Response) {
+                        val json = response.body?.string() ?: ""
+                        val parsed = parseSchedule(json)
+                        scope.launch(Dispatchers.Main) {
+                            if (!isRequestCurrent()) return@launch
+                            isLoading = false
+                            if (parsed.isNotEmpty()) {
+                                saveScheduleToCache(cacheKey, json)
+                                courses = reloadCustomCourses(parsed)
+                                if (forceRefresh) Toast.makeText(context, "已刷新", Toast.LENGTH_SHORT).show()
+                            } else if (courses.isEmpty()) {
+                                Toast.makeText(context, "暂无课程", Toast.LENGTH_SHORT).show()
+                            }
                         }
                     }
                 }
-            })
+            )
         }
     }
 
