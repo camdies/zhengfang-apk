@@ -84,13 +84,12 @@ import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
 import androidx.compose.ui.util.lerp
 import com.kyant.backdrop.Backdrop
-import com.kyant.backdrop.backdrops.layerBackdrop
-import com.kyant.backdrop.backdrops.rememberCombinedBackdrop
-import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
 import com.kyant.backdrop.effects.vibrancy
+import com.kyant.backdrop.highlight.Highlight
+import com.kyant.backdrop.shadow.InnerShadow
 import com.kyant.backdrop.shadow.Shadow
 import com.tyust.course.ui.system.glass.DampedDragAnimation
 import com.tyust.course.ui.system.glass.InteractiveHighlight
@@ -131,12 +130,10 @@ fun LiquidSegmentedControl(
     val isLightTheme = !isSystemInDarkTheme()
     val trackShape = RoundedCornerShape(percent = 50)
     val indicatorShape = RoundedCornerShape(percent = 50)
-    val trackBackdrop = if (useGlass) rememberLayerBackdrop() else null
-    val indicatorBackdrop = if (glassBackdrop != null && trackBackdrop != null) {
-        rememberCombinedBackdrop(glassBackdrop, trackBackdrop)
-    } else {
-        null
-    }
+    // 页面内组件不得使用隐藏 layerBackdrop + combined 采样：
+    // 该结构嵌套在底栏捕获层的 record 会话中，GraphicsLayer 被多处引用，
+    // API 37 上会把 tint 内容错位绘制成底栏上方的残影。指示器直接采样壁纸层。
+    val indicatorBackdrop = glassBackdrop
     val animationScope = rememberCoroutineScope()
     val accessibility = rememberGlassAccessibilityMode()
     val interactiveHighlight = remember(animationScope) {
@@ -229,6 +226,17 @@ fun LiquidSegmentedControl(
         Box(
             modifier = Modifier
                 .fillMaxSize()
+                .graphicsLayer {
+                    // 轨道随滑块果冻回弹同步呼吸
+                    if (!accessibility.reduceMotion) {
+                        val boost = (
+                            (dragAnimation.scaleX + dragAnimation.scaleY) / 2f - 1f
+                            ).coerceIn(0f, 0.4f)
+                        val scale = 1f + boost * 0.15f
+                        scaleX = scale
+                        scaleY = scale
+                    }
+                }
                 .clip(trackShape)
                 .background(trackBackgroundColor)
                 .drawBehind {
@@ -239,55 +247,6 @@ fun LiquidSegmentedControl(
                     )
                 }
         )
-
-        if (trackBackdrop != null) {
-            Row(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .clearAndSetSemantics {}
-                    .alpha(0f)
-                    .layerBackdrop(trackBackdrop)
-                    .clip(trackShape)
-                    .background(trackBackgroundColor)
-                    .drawBehind {
-                        drawRoundRect(
-                            color = trackBorderColor,
-                            cornerRadius = CornerRadius(size.height / 2f),
-                            style = androidx.compose.ui.graphics.drawscope.Stroke(
-                                width = 0.75.dp.toPx()
-                            )
-                        )
-                    }
-                    .padding(horizontal = horizontalPadding, vertical = verticalPadding),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                options.forEach { label ->
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxHeight(),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = label,
-                            modifier = Modifier.padding(
-                                horizontal = if (compact) 6.dp else 10.dp
-                            ),
-                            style = if (compact) {
-                                MaterialTheme.typography.labelSmall
-                            } else {
-                                MaterialTheme.typography.labelLarge
-                            },
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.primary,
-                            maxLines = 1,
-                            softWrap = false,
-                            overflow = if (compact) TextOverflow.Clip else TextOverflow.Ellipsis
-                        )
-                    }
-                }
-            }
-        }
 
         val indicatorHeight = (height - verticalPadding * 2).coerceAtLeast(1.dp)
         val indicatorBaseModifier = Modifier
@@ -335,7 +294,7 @@ fun LiquidSegmentedControl(
                                 enableBlur = false,
                                 allowChromaticAberration = true,
                                 pressScalesRefraction = true,
-                                refractionFloor = 0.55f
+                                refractionFloor = 0.42f
                             )
                             if (params.useLens) {
                                 lens(
@@ -345,9 +304,40 @@ fun LiquidSegmentedControl(
                                 )
                             }
                         } else {
-                            // API31/32：固定 blur 毛玻璃滑块，对齐底栏
-                            blur(GlassRecipe.NavLegacyIndicatorBlurDp.dp.toPx())
+                            // 31/32：lens 为平台 no-op，直接 blur 出毛玻璃（不再依赖轨道采样层）
+                            blur(8.dp.toPx())
+                            lens(
+                                refractionHeight = 10.dp.toPx() * press,
+                                refractionAmount = 14.dp.toPx() * press,
+                                chromaticAberration = true
+                            )
                         }
+                    },
+                    highlight = {
+                        val press = dragAnimation.pressProgress
+                        // 描边宽度随按压缩放反向补偿，保持细度恒定
+                        val scaleComp = (
+                            (dragAnimation.scaleX + dragAnimation.scaleY) / 2f
+                            ).coerceAtLeast(1f)
+                        if (hasRealLens) {
+                            Highlight.Default.copy(
+                                width = Highlight.Default.width / scaleComp,
+                                blurRadius = Highlight.Default.blurRadius / scaleComp,
+                                alpha = 0.12f + press * 0.35f
+                            )
+                        } else {
+                            Highlight.Default.copy(
+                                width = Highlight.Default.width / scaleComp,
+                                alpha = press * 0.35f
+                            )
+                        }
+                    },
+                    innerShadow = {
+                        val press = dragAnimation.pressProgress
+                        InnerShadow(
+                            radius = 4.dp * press,
+                            alpha = press * 0.5f
+                        )
                     },
                     layerBlock = {
                         if (accessibility.reduceMotion) {
@@ -363,23 +353,36 @@ fun LiquidSegmentedControl(
                         }
                     },
                     shadow = {
-                        val shadowAlpha = lerp(
-                            GlassRecipe.SegIndicatorShadowAlpha,
-                            GlassRecipe.SegIndicatorPressedShadowAlpha,
-                            dragAnimation.pressProgress
-                        )
-                        Shadow(alpha = shadowAlpha)
+                        val press = dragAnimation.pressProgress
+                        if (hasRealLens) {
+                            Shadow(
+                                alpha = lerp(
+                                    GlassRecipe.SegIndicatorShadowAlpha,
+                                    GlassRecipe.SegIndicatorPressedShadowAlpha,
+                                    press
+                                )
+                            )
+                        } else {
+                            // 按压渐显投影（减半，残影更轻）
+                            Shadow(alpha = press * 0.5f)
+                        }
                     },
                     onDrawSurface = {
                         val press = dragAnimation.pressProgress
                         if (hasRealLens) {
+                            // 低透明中性 tint，静止即玻璃；按下更透露出折射/色散
                             val solidColor = if (isLightTheme) {
                                 Color(GlassRecipe.NavSelectedSolidColorLight)
                             } else {
                                 Color(GlassRecipe.NavSelectedSolidColorDark)
                             }
+                            val restAlpha = if (isLightTheme) {
+                                GlassRecipe.NavSelectedSolidAlpha
+                            } else {
+                                GlassRecipe.NavSelectedSolidAlphaDark
+                            }
                             val fillAlpha = lerp(
-                                GlassRecipe.NavSelectedSolidAlpha,
+                                restAlpha,
                                 GlassRecipe.NavSelectedGlassAlpha,
                                 press
                             )
@@ -387,7 +390,7 @@ fun LiquidSegmentedControl(
                                 drawRect(solidColor.copy(alpha = fillAlpha))
                             }
                         } else {
-                            // API32 cba2a09：Black×0.1
+                            // API31/32 cba2a09：Black×0.1
                             drawRect(Color.Black.copy(0.1f), alpha = 1f - press)
                             drawRect(Color.Black.copy(alpha = 0.03f * press))
                         }
