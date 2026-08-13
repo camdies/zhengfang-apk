@@ -254,7 +254,7 @@ private fun OverallGradesContent(
                             items = listOf(
                                 "累计绩点" to stats.gpa.ifBlank { "0.00" },
                                 "已修学分" to stats.credits.ifBlank { "0" },
-                                "总课程" to stats.courseCount.toString()
+                                "已出成绩" to stats.courseCount.toString()
                             )
                         )
                         GradeDistributionCard(stats = stats)

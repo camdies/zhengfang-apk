@@ -17,6 +17,7 @@ import com.tyust.course.session.SessionRegistry
 import com.tyust.course.session.SessionResponseClassification
 import com.tyust.course.session.SessionResponseClassifiers
 import com.tyust.course.session.SessionResponseState
+import com.tyust.course.session.SchoolSessionScope
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Response
@@ -65,6 +66,12 @@ object CookieWatchdog {
 
     @JvmStatic
     fun start(@Suppress("UNUSED_PARAMETER") ctx: Context, intervalMs: Long = DEFAULT_INTERVAL_MS) {
+        val currentSchool = UserManager.getInstance().currentSchool
+        if (SchoolSessionScope.isCanonicalScnu(currentSchool)) {
+            stop()
+            Log.d(TAG, "SCNU CookieWatchdog disabled: strict background session probe is not enabled")
+            return
+        }
         if (running) return
         this.intervalMs = intervalMs
         this.currentDelayMs = intervalMs

@@ -12,7 +12,7 @@ object ScnuProtocolCapabilities {
     // 成绩接口已用真实教务 Cookie 验证可用（2026-08-12）
     const val ACADEMIC_PROFILE_ENABLED: Boolean = true
     // 选课接口已确认存在且正常响应（非选课季返回"当前不属于选课"），协议本身可用
-    const val COURSE_SELECTION_ENABLED: Boolean = true
+    const val COURSE_SELECTION_ENABLED: Boolean = false
 
     @JvmStatic
     fun isCanonicalScnu(school: SchoolConfig?): Boolean = SchoolSessionScope.isCanonicalScnu(school)

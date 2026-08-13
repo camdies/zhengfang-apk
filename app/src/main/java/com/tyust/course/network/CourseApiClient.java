@@ -12,6 +12,7 @@ import okhttp3.Cookie;
 import okhttp3.CookieJar;
 import okhttp3.FormBody;
 import okhttp3.HttpUrl;
+import okhttp3.Interceptor;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
@@ -44,7 +45,9 @@ public class CourseApiClient {
         private static final ThreadLocal<String> ACCOUNT_OVERRIDE_STORAGE_KEY = new ThreadLocal<>();
         private static volatile CourseApiClient instance;
         private final OkHttpClient client;
+        private final OkHttpClient strictTlsClient;
         private final AccountCookieJar cookieJar;
+        private final Interceptor sessionAwareInterceptor;
         private Context appContext;
 
         public static final String ACTION_COOKIE_EXPIRED = "com.tyust.course.ACTION_COOKIE_EXPIRED";
@@ -83,13 +86,7 @@ public class CourseApiClient {
                                 }
                 };
 
-                OkHttpClient.Builder builder = new OkHttpClient.Builder()
-                                .cookieJar(cookieJar)
-                                .followRedirects(true)
-                                .followSslRedirects(true)
-                                .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-                                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-                                .addInterceptor(chain -> {
+                sessionAwareInterceptor = chain -> {
                                         Request original = chain.request();
                                         SessionRequestContext requestContext = original.tag(SessionRequestContext.class);
                                         String requestAccountStorageKey = requestContext != null
@@ -141,19 +138,33 @@ public class CourseApiClient {
                                         } finally {
                                                 AccountCookieJar.clearRequestAccountKey();
                                         }
-                                });
+                                };
+
+                OkHttpClient.Builder insecureBuilder = newBaseClientBuilder();
+                OkHttpClient.Builder strictBuilder = newBaseClientBuilder();
 
                 try {
                         javax.net.ssl.SSLContext sslContext = javax.net.ssl.SSLContext.getInstance("TLS");
                         sslContext.init(null, trustAllCerts, new java.security.SecureRandom());
-                        builder.sslSocketFactory(sslContext.getSocketFactory(),
+                        insecureBuilder.sslSocketFactory(sslContext.getSocketFactory(),
                                         (javax.net.ssl.X509TrustManager) trustAllCerts[0]);
-                        builder.hostnameVerifier((hostname, session) -> true);
+                        insecureBuilder.hostnameVerifier((hostname, session) -> true);
                 } catch (Exception e) {
                         Log.e(TAG, "Failed to setup SSL bypass: " + e.getMessage());
                 }
 
-                client = builder.build();
+                client = insecureBuilder.build();
+                strictTlsClient = strictBuilder.build();
+        }
+
+        private OkHttpClient.Builder newBaseClientBuilder() {
+                return new OkHttpClient.Builder()
+                                .cookieJar(cookieJar)
+                                .followRedirects(true)
+                                .followSslRedirects(true)
+                                .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                                .addInterceptor(sessionAwareInterceptor);
         }
 
         public static CourseApiClient getInstance() {
@@ -494,7 +505,10 @@ public class CourseApiClient {
                                 .tag(SessionRequestContext.class, context)
                                 .url(url)
                                 .build();
-                client.newCall(request).enqueue(callback);
+                OkHttpClient requestClient = SchoolSessionScope.isCanonicalScnu(school)
+                                ? strictTlsClient
+                                : client;
+                requestClient.newCall(request).enqueue(callback);
         }
 
         // 轻量服务器健康检查：复用账号 Cookie、SSL 兼容和统一请求头，探测真实教务路径。

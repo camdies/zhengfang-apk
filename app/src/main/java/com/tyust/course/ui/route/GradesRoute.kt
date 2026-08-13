@@ -469,7 +469,7 @@ fun GradesRoute() {
                             runOnUiThreadForResponse(indexResponse) {
                                 overallIsLoading = false
                                 overallGrades = resultGrades
-                                overallStats = GradesLogic.calculateStats(resultGrades, gpa, credits, count)
+                                overallStats = GradesLogic.calculateStats(resultGrades, gpa, credits)
                             }
                         },
                         onConfirmedExpired = { expired ->
@@ -658,7 +658,7 @@ private fun escapeCsv(value: String): String {
 }
 
 // Logic Object
-private object GradesLogic {
+internal object GradesLogic {
     fun parseGradesJson(json: String): List<GradeItemUi> {
         val result = mutableListOf<GradeItemUi>()
         try {
@@ -719,6 +719,16 @@ private object GradesLogic {
             }
         } catch (e: Exception) { }
         return result
+    }
+
+    /**
+     * Overall-grade requests enumerate the full teaching-plan scope. A course
+     * belongs in the overall result only after the teaching system has supplied
+     * a real grade value. "--" is this UI's established missing-grade marker.
+     */
+    fun hasRecordedOverallGrade(item: GradeItemUi): Boolean {
+        val grade = item.grade.trim()
+        return grade.isNotEmpty() && grade != "--"
     }
 
     fun mergeDetails(baseGrades: List<GradeItemUi>, detailJson: String): List<GradeItemUi> {
@@ -929,7 +939,10 @@ private object GradesLogic {
                     return
                 }
                 if (!response.isCurrent) return
-                val items = parseGradesJson(response.body)
+                // Overall queries enumerate every course in the plan. Filter
+                // before de-duplication so an ungraded record cannot suppress
+                // a later recorded result for the same course.
+                val items = parseGradesJson(response.body).filter(::hasRecordedOverallGrade)
                 items.forEach { newItem ->
                     if (accumulatedGrades.none { it.courseName == newItem.courseName }) {
                         accumulatedGrades.add(newItem)
@@ -943,7 +956,7 @@ private object GradesLogic {
         })
     }
     
-    fun calculateStats(grades: List<GradeItemUi>, baseGPA: String, baseCredits: Double, baseCount: Int): OverallStatsUi {
+    fun calculateStats(grades: List<GradeItemUi>, baseGPA: String, baseCredits: Double): OverallStatsUi {
         var totalCredits = 0.0
         var weightedGPA = 0.0
         var excellent = 0
@@ -970,7 +983,7 @@ private object GradesLogic {
             if (totalCredits > 0) String.format("%.2f", weightedGPA / totalCredits) else "0.00"
         }
         val displayCredits = if (totalCredits > 0) String.format("%.1f", totalCredits) else String.format("%.1f", baseCredits)
-        val displayCount = if (grades.isNotEmpty()) grades.size else baseCount
+        val displayCount = grades.size
 
         return OverallStatsUi(displayGPA, displayCredits, displayCount, excellent, good, medium, pass)
     }

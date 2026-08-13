@@ -285,7 +285,7 @@ public class UserManager {
                 upsertCurrentAccountRecord();
             }
 
-            Log.d(TAG, "登录状态已保存: isLoggedIn=" + isLoggedIn + ", student=" + studentName);
+            Log.d(TAG, "登录状态已保存: isLoggedIn=" + isLoggedIn);
         } catch (Exception e) {
             Log.e(TAG, "保存登录状态失败: " + e.getMessage());
         }
@@ -338,7 +338,7 @@ public class UserManager {
                 savedCookie = "";
             }
 
-            Log.d(TAG, "登录状态已加载: isLoggedIn=" + isLoggedIn + ", student=" + studentName + ", school="
+            Log.d(TAG, "登录状态已加载: isLoggedIn=" + isLoggedIn + ", school="
                     + (currentSchool != null ? currentSchool.name : "null"));
         } catch (Exception e) {
             Log.e(TAG, "加载登录状态失败: " + e.getMessage());
@@ -1165,7 +1165,7 @@ public class UserManager {
         }
 
         refreshRuntimeForCurrentAccount();
-        Log.d(TAG, "已切换账号: " + studentName + " @ " + school.name);
+        Log.d(TAG, "已切换账号，school=" + school.name);
         return true;
     }
 

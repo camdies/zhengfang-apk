@@ -2,6 +2,8 @@ package com.tyust.course.session
 
 import com.tyust.course.model.SchoolConfig
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AcademicApiModeAndLegacyApiTest {
@@ -19,6 +21,15 @@ class AcademicApiModeAndLegacyApiTest {
             AcademicApiMode.Legacy,
             AcademicApiModeResolver.resolve(legacySchool())
         )
+    }
+
+    @Test
+    fun `verified login and academic capabilities stay enabled while SCNU selection stays closed`() {
+        assertTrue(ScnuProtocolCapabilities.LOGIN_ENABLED)
+        assertTrue(ScnuProtocolCapabilities.ACADEMIC_PROFILE_ENABLED)
+        assertTrue(ScnuProtocolCapabilities.isAcademicProfileAvailable(canonicalScnuSchool()))
+        assertFalse(ScnuProtocolCapabilities.isCourseSelectionAllowed(canonicalScnuSchool()))
+        assertTrue(ScnuProtocolCapabilities.isCourseSelectionAllowed(legacySchool()))
     }
 
     @Test
