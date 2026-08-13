@@ -6,9 +6,9 @@ import org.junit.Test
 
 class AcademicApiModeAndLegacyApiTest {
     @Test
-    fun `only the canonical SCNU scope is held behind the academic protocol gate`() {
+    fun `canonical SCNU resolves to legacy academic api mode once verified`() {
         assertEquals(
-            AcademicApiMode.ProtocolNotVerified,
+            AcademicApiMode.Legacy,
             AcademicApiModeResolver.resolve(canonicalScnuSchool())
         )
         assertEquals(

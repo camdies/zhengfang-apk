@@ -153,8 +153,8 @@ class SessionProbeTest {
     }
 
     @Test
-    fun `canonical scnu course selection stays closed`() {
-        assertFalse(CourseSelectionCapability.isSupported(canonicalScnu()))
+    fun `canonical scnu course selection is enabled once verified`() {
+        assertTrue(CourseSelectionCapability.isSupported(canonicalScnu()))
         assertTrue(CourseSelectionCapability.isSupported(legacySchool()))
     }
 

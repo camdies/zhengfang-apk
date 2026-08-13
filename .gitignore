@@ -6,6 +6,7 @@ app/build/
 
 # IDE
 /.idea/
+/.run/
 *.iml
 .DS_Store
 

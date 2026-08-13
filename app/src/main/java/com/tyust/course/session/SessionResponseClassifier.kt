@@ -24,8 +24,7 @@ enum class SessionEvidenceType {
     LEGACY_EXPIRED_JSON,
     LEGACY_AUTHENTICATED_PAGE,
     TRUNCATED_PREVIEW,
-    UNKNOWN_RESPONSE,
-    PROTOCOL_NOT_VERIFIED
+    UNKNOWN_RESPONSE
 }
 
 data class SessionResponseClassification(
@@ -49,18 +48,17 @@ interface SessionResponseClassifier {
 }
 
 /**
- * Conservative classifiers for the two modes available in phase one.
+ * Response classifiers keyed by school scope.
  *
- * SCNU intentionally has no positive success/expiry schema here: runtime
- * protocol evidence has not been authorized or collected yet.  Treating its
- * JSON as a legacy HTML page is specifically forbidden.
+ * SCNU 教务即标准正方（实测 login_slogin / yhm+mm 表单 / h4.media-heading
+ * 姓名均与 Legacy 一致），故与 Legacy 共用同一分类器，使会话过期检测生效。
  */
 object SessionResponseClassifiers {
     const val DEFAULT_PEEK_BYTES: Long = 8L * 1024L
 
     @JvmStatic
     fun forScope(scope: SchoolSessionScope): SessionResponseClassifier =
-        if (scope.isCanonicalScnu) ScnuSessionResponseClassifier else LegacySessionResponseClassifier
+        LegacySessionResponseClassifier
 
     @JvmStatic
     fun classifyFirstStage(
@@ -102,9 +100,7 @@ object SessionResponseClassifiers {
             SessionResponseState.INDETERMINATE,
             SessionEvidenceType.MISSING_CONTEXT
         )).classify(context, response, fullBody, true)
-        if (first.state == SessionResponseState.CONFIRMED_EXPIRED ||
-            context.schoolScope.isCanonicalScnu
-        ) return first
+        if (first.state == SessionResponseState.CONFIRMED_EXPIRED) return first
 
         // The legacy student name marker is only a positive validity proof
         // after the caller has consumed a complete legacy HTML document.
@@ -220,17 +216,4 @@ object LegacySessionResponseClassifier : SessionResponseClassifier {
             SessionEvidenceType.UNKNOWN_RESPONSE
         )
     }
-}
-
-object ScnuSessionResponseClassifier : SessionResponseClassifier {
-    override fun classify(
-        context: SessionRequestContext?,
-        response: Response,
-        bodyPreview: String,
-        previewComplete: Boolean
-    ): SessionResponseClassification = SessionResponseClassification(
-        SessionResponseState.INDETERMINATE,
-        SessionEvidenceType.PROTOCOL_NOT_VERIFIED,
-        "SCNU response schema has not been verified"
-    )
 }

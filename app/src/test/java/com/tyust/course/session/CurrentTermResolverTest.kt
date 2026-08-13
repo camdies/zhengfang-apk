@@ -9,12 +9,15 @@ import java.util.GregorianCalendar
 
 class CurrentTermResolverTest {
     @Test
-    fun `canonical SCNU without a verified term or account cache reports protocol not verified`() {
+    fun `canonical SCNU falls back to calendar term like legacy schools`() {
         val resolver = TermResolver(calendarProvider = { fixedCalendar(2026, Calendar.MARCH) })
 
         val result = resolver.resolveCurrentTerm(canonicalScnu(), "scnu-account")
 
-        assertEquals(CurrentTermResolution.ProtocolNotVerified, result)
+        val available = assertAvailable(result)
+        assertEquals("2025", available.term.academicYear)
+        assertEquals("12", available.term.termCode)
+        assertEquals(AcademicTermSource.LEGACY_CALENDAR, available.term.source)
     }
 
     @Test

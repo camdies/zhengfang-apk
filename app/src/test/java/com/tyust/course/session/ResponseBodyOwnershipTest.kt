@@ -61,7 +61,7 @@ class ResponseBodyOwnershipTest {
     }
 
     @Test
-    fun `canonical SCNU full body is not reclassified using legacy validity evidence`() {
+    fun `canonical SCNU full body is reclassified using legacy validity evidence`() {
         val context = canonicalScnuContext()
         val html = "<html><input name=\"xm\" value=\"Student\"></html>"
         response(context, html).use { value ->
@@ -72,8 +72,8 @@ class ResponseBodyOwnershipTest {
                 value.body!!.string()
             )
 
-            assertEquals(SessionResponseState.INDETERMINATE, completeBody.state)
-            assertEquals(SessionEvidenceType.PROTOCOL_NOT_VERIFIED, completeBody.evidenceType)
+            assertEquals(SessionResponseState.VALID, completeBody.state)
+            assertEquals(SessionEvidenceType.LEGACY_AUTHENTICATED_PAGE, completeBody.evidenceType)
         }
     }
 
